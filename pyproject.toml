@@ -1,0 +1,19 @@
+[project]
+name = "rural-bank-kb-agent"
+version = "0.1.0"
+description = "农商行知识问答 RAG Agent"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    "httpx>=0.27,<1.0",
+    "pydantic-settings>=2.6,<3.0",
+    "langchain>=1.2,<1.3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
