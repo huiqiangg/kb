@@ -1,4 +1,4 @@
-# 农商行知识问答 Agent
+# 知识问答 Agent
 
 基于 FastAPI、LangChain 1.2 和 LLMOps 知识库的流式 RAG 服务。接口为 `POST /api/kb/chat/completions`，根路径提供简单的调试网页，Swagger 位于 `/docs`。
 
