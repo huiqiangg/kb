@@ -2,18 +2,30 @@ from pathlib import Path
 import logging
 import time
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from app.core.config import get_settings
+from app.core.db import get_database
 from app.core.logging import configure_logging
 from app.routers.chat import router as chat_router
 
 settings = get_settings()
 configure_logging(settings.log_level)
 logger = logging.getLogger(__name__)
-app = FastAPI(title=settings.app_name, version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    yield
+    # 仅在用到过连接池时才会真正释放
+    await get_database().dispose()
+
+
+app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 app.include_router(chat_router)
 
 
