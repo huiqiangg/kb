@@ -2,7 +2,7 @@ CREATE TABLE rag_keywords_mapping (
     id BIGINT PRIMARY KEY  AUTO_INCREMENT COMMENT '主键',
     source_term VARCHAR(100) NOT NULL COMMENT '用户术语',
     standard_term VARCHAR(100) NOT NULL COMMENT '银行标准术语',
-    enabled TINYINT NOT NULL DEFAULT 1 COMMENT '是否启用：1启用，0禁用',
+    enabled TINYINT NOT NULL DEFAULT 1 COMMENT '是否启用：1启用，0禁用'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='银行RAG术语映射表';
 
 CREATE TABLE rag_prompt (
@@ -12,7 +12,7 @@ CREATE TABLE rag_prompt (
     system_content TEXT NOT NULL COMMENT '系统提示词：固定指令，不含变量',
     user_content TEXT NOT NULL COMMENT '用户提示词：含 {变量} 占位符',
     status TINYINT NOT NULL DEFAULT 1 COMMENT '状态：1启用，0禁用',
-    modify_time INT NOT NULL COMMENT '修改时间，Unix时间戳',
+    modify_time INT NOT NULL COMMENT '修改时间，Unix时间戳'
 ) COMMENT='RAG提示词配置表';
 
 INSERT INTO rag_keywords_mapping
@@ -53,10 +53,7 @@ VALUES
 -- 贷款还款
 -- =========================
 ('还贷', '偿还贷款'),
-('提前还贷', '贷款提前还款'),
-('提前还款', '贷款提前还款'),
-('部分提前还款', '贷款部分提前还款'),
-('还款期限', '贷款期限'),
+('提前还贷', '提前还款'),
 ('月供', '月还款额'),
 -- =========================
 -- 银行卡 / 账户

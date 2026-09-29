@@ -18,8 +18,17 @@
   docker exec -i intent-mysql mysql -uroot -p'***' --default-character-set=utf8mb4 kb < db.sql
   ```
   整份文件经 stdin 管道喂给 mysql 是**可行的**（`\n` / `\"` 都会按预期转义，中文不乱码）；
-  重建后应得 **47 条术语 + 3 条提示词**、无重复术语。核对用
+  重建后条数**与 `db.sql` 一致**为准（2026-09-29 词表精简后是 **44 条术语 + 3 条提示词**，
+  之前是 47 条 —— 别死记数字，按文件数）。核对用
   `sync_rag_prompt.py --dry-run`（提示词）+ 应用层连接读一遍（术语）。
+- **本机没有 `mysql` CLI**（MySQL 只在 OrbStack 容器 `intent-mysql` 里），所以
+  「按 `db.sql` 重建」的常规做法是**用项目自己的 async 引擎**跑脚本，不要为它装 CLI：
+  `scripts/reload_term_mapping.py`（**2026-09-29 新增**，只重建术语表：DROP + 建表 + INSERT
+  全部从 `db.sql` 原样抽出，做完打印行数并用 `TermMapper` 跑替换自检）。
+- **`db.sql` 的 `CREATE TABLE` 不能有尾逗号**（MySQL 语法，`ERROR 1064 near ')'`）：
+  2026-09-29 原始文件两处 `enabled ... '...,'\n)` 都是坏的，**整份执行必失败** ——
+  已修掉。以后再改初始化脚本，最后一行列定义不要带逗号；验证手段是「临时库整份跑一遍」：
+  建 `<db>_sqlcheck` → 逐条执行 → 核对行数 → `DROP DATABASE`，不碰真实库。
 - 访问方式：SQLAlchemy async + aiomysql，惰性建池，`pool_pre_ping`。
 - **读表一律 `.mappings()` 后按列名取值**（`_text_column(row, "system_content")`），
   **不要写 `for key, system, user in rows` 这类位置解包** —— 用户 2026-09-28 指出这种写法
@@ -28,7 +37,7 @@
   `scripts/sync_rag_prompt.py` 里的 `row[0]` / `tuple(stored)` 也一并改成了 mappings 写法。
 
 ## 配置表读取策略
-- 术语映射与提示词**从 DB 读取**，进程内 TTL 缓存 60s（`DB_CACHE_TTL_SECONDS`），
+- 术语映射与提示词**从 DB 读取**，进程内 TTL 缓存 300s（`DB_CACHE_TTL_SECONDS`），
   库不可用或查不到记录时**回落代码内置**，不阻断问答。
 - `DB_ENABLED=false` 可整体绕开数据库（离线/单测用）。
 - **缓存并发语义（`_TtlStore`，2026-09-28）**：同一 repository 的并发 `get()` **只触发一次
@@ -85,6 +94,16 @@
 - 标签提取仍用内置提示词（DB 中无对应记录，未给它配 key）。
 - DB 中的提示词含 JSON 输出示例（花括号），**不要用 `str.format` / `ChatPromptTemplate` 渲染**，
   须用 `app/services/prompting.py` 的显式占位符替换。
+- **术语映射的冷加载会算在「关键词替换」耗时里**（日志紧跟在 `术语映射表已加载：N 条` 之后）：
+  首次 ~25–60ms（容器网络冷时可到 400ms），TTL 内 0.0x ms。用户问「为什么 211ms」时按此解释，
+  别答成「替换算法慢」。是否启动预热是取舍问题（与「启动不主动连库」冲突），不默认加。
+- **术语表数据坑（2026-09-29 已由用户改词表解决）**：原表里
+  `房贷→个人住房贷款` + `提前还款→贷款提前还款` 同时命中会拼出
+  「个人住房贷款能贷款提前还款吗」（两条替换都对，是标准词自带公共前缀）。
+  用户已把 `提前还款` / `部分提前还款` 两条**删掉**，改成 `还贷→偿还贷款`、`提前还贷→提前还款`，
+  现在「房贷能提前还款吗」→「个人住房贷款能提前还款吗」。
+  排查这类「替换后读不通」的问题，先逐条打印命中的 `source→standard` 再判断是词表还是逻辑；
+  **词表是用户业务数据，不要擅自改**（这次也是等用户改完再重建）。
 
 ## 检索链路
 - 完整链路：**术语映射 → FAQ 直返探测（跨库 `kbs:mix-retrieve`，只探 `knowledgeType==2` 的库）→
@@ -92,9 +111,24 @@
 - **空间层级（2026-09-29 起）**：平台侧是「租户(`tenantId`) → 空间(`project_id`) → 知识库」，
   且**知识库不支持跨空间检索**。门户在每条 `ranges` 项里带 `project_id` / `tenantId` /
   `knowledgeType`（1 切片，2 标准问答），字段名两种写法都收（`AliasChoices`）。
-  `project_id`/`tenantId` 是**空间级 query 参数**，不是全局配置 —— 所以 ranges 跨空间时
-  必须按 `(project_id, tenantId)` 分组，每组各发一次请求。
-  **`knowledgeType` 是门户入参字段，两份 LLMOps 平台文档里都没有，不要放进出网 body**。
+  `project_id`/`tenant_id` 的位置**两条通道不同**（用户 2026-09-29 两次定稿）：
+  - `mix_retrieve`（外部方给的接口）→ **普通 POST**：`client.post(url, json=payload)`，
+    **不带查询参数、不带任何请求头**（不要 `Authorization`），**body 只有三项**：
+    `{"query": …, "keywords": […], "ranges": […]}`，**不要 disable_rerank / rerank_params**。
+    `ranges` **直接用本次请求的 ranges**（`model_dump(by_alias=True, exclude_unset=True)`，
+    门户传什么发什么、含 `project_id`/`tenantId`/`knowledgeType`，没传的字段不补空值），
+    **一次请求全部发完**、不按空间分组。
+    用户原话：「这是外部接口，只吃一个空间，不要分组、就发一次」+
+    「ranges 直接使用 request 请求的 ranges，请求头不需要加 Authorization，就是一个普通的 post 请求」+
+    「请求 body 是这样 {query, keywords, ranges}，ranges 就是本次 http 请求的 ranges」。
+  - `faq_retrieve`（平台接口）→ `project_id`/`tenantId` 查询参数
+    （`project_id` 取 range 自带的、缺省回落 `KB_PROJECT_ID`；`tenantId` 只认 range 自带的），
+    body = 上述三项 +
+    `disable_rerank=false` + `rerank_params`（`_faq_body()`），ranges 只带
+    `knowledge_base_id`/`doc_range`，跨空间时按 `(project_id, tenantId)` 分组、每组各发一次。
+  **出网 ranges 的键名靠 `serialization_alias` 还原成门户驼峰**（`tenantId` / `knowledgeType`）——
+  只加 `validation_alias` 时序列化仍是模型字段名（`tenant_id`），2026-09-29 踩过一次；
+  `project_id` / `knowledge_base_id` / `doc_range` 门户本来就叫这个，无需别名。
 - **`knowledgeType` 必须严格等于 `2` 才是 QA 库（用户 2026-09-29 明确更正）**：
   不传（`None`）与传 `1` 都**不参与 FAQ 直返**，一次 FAQ 探测都不发。
   曾按「未知保留为候选」实现，用户否掉 —— `None` 是被当成 QA 库塞进跨库检索、白跑一次
@@ -106,24 +140,49 @@
   **但 `KB_FAQ_RETRIEVE_URL` / `faq_retrieve_url` 保留** —— 用户 2026-09-29 明确
   「FAQ 库地址可能与 `KB_MIX_RETRIEVE_URL` 不是一个 url，只是返回结构一样」：
   两条通道是同一接口的两处部署，地址各自可整条覆盖；FAQ 地址留空则**回落 mix 地址**。
-- 跨库请求体：`query`（用改写结果，失败回落术语映射结果）、`keywords`（改写同一次调用产出的
-  业务关键词；**FAQ 探测传空数组**，回归脚本就靠这个区分两类请求）、`ranges`、`disable_rerank=false`
-  + `rerank_params`（跨库必须重排；`weight_type=1` 动态权重 WRRF 就不必传 rerank 模型对象）。
+- 跨库请求体两条通道不同：`query`（用改写结果，失败回落术语映射结果）、`keywords`（改写同一次
+  调用产出的业务关键词；**FAQ 探测传空数组**）两边都有；`disable_rerank=false` + `rerank_params`
+  （跨库必须重排；`weight_type=1` 动态权重 WRRF 就不必传 rerank 模型对象）**只有 FAQ 那条有**，
+  最终检索（外部接口）body 只有三项。
+  **回归脚本按「body 里有没有 `disable_rerank`」区分两类请求**（原来按 keywords 是否为空，
+  改写失败时 keywords 恰好为空会误判）。
 - 响应结构与单库检索一致：`result[].chunk.content` + `result[].score` / `doc_id` / `doc_name` /
   `knowledge_base_id`；取分最高的 `FINAL_CONTEXT_TOP_K` 条拼上下文。
   **标准问答库的答案优先取 `chunk.qa_pairs[].answer`，其次才是 `chunk.content`。**
 - 跨库检索失败**只记 warning 返回空列表**，走 `answer_type=no_context` 降级，不抛异常。
-- `KB_TENANT_ID`（留空则不带 `tenantId` 参数）。
+- **召回接口不配鉴权、租户没有全局兜底（2026-09-29 用户定稿）**：`.env` 里的
+  `KB_AUTHORIZATION` 与 `KB_TENANT_ID` **已删**，代码里也没有这两个字段了 ——
+  `settings.kb_authorization` / `settings.kb_tenant_id` 都不要再加回来。
+  即两条通道**都不拼 `Authorization` 头**；`project_id` 保留全局兜底 `KB_PROJECT_ID`
+  （只对 FAQ 探测生效），`tenantId` 只认 `ranges` 自带的（取不到就不拼该查询参数）。
+  回归脚本里有一条「两条通道都不带 Authorization」守着，防以后被顺手加回来。
 - **召回接口 IP/路径待定**，因此地址支持整条覆盖，且**两个通道各自一个变量**：
   `KB_MIX_RETRIEVE_URL`（最终检索）与 `KB_FAQ_RETRIEVE_URL`（FAQ 探测，留空复用前者）。
   **不要再把 `{base}/applet/api/v1/...` 硬拼在客户端里** —— 用户明确说过地址还没定；
-  客户端内部也别写死用 `mix_retrieve_url`，地址作为参数传（`_retrieve(url, payload, scope)`）。
-- **两条通道共用同一份分组实现（2026-09-29 已修）**：FAQ 探测与最终检索只差地址与
-  `keywords`，所以内部只有一个 `_retrieve(query, keywords, ranges, url)`，对外两个一行转发的
-  入口。此前两条路各写一份，结果只给 FAQ 做了按空间分组、`mix_retrieve` 仍用全局
-  `KB_PROJECT_ID`/`KB_TENANT_ID`，跨空间请求会落到错误的空间 —— 合并后这类
-  「复制实现只改了一边」的 bug 结构性消失。`asyncio.gather(return_exceptions=True)`
-  的顺序与传入一致，`zip(groups, outcomes)` 就能把失败组与它的 project_id 一起打进 warning。
+  两条通道各自从 `settings.mix_retrieve_url` / `settings.faq_retrieve_url` 取地址，
+  不再有「把 url 当参数传」的通用方法（一个通道一个地址来源，传参只是死参数）。
+- **两条通道：请求形状各一份、响应解析共用一份（2026-09-29 用户定稿，晚间再确认响应同构）**。
+  `mix_retrieve()` 调的是**外部方提供的接口**，请求流程**自带一份**、不借道 FAQ 那条 —— 用户原话
+  「这个接口是别人提供给我的」，意思是契约变化要能只落在一处。
+  所以**没有 `_retrieve()` 这个共用方法了**（曾在 2026-09-29 上午合并出来，下午按用户要求拆开）。
+  现在：请求体与发请求各有一份 —— FAQ 走 `_faq_body()`（前三项 + rerank 参数 + `_kb_ranges()` 投影）
+  + `_faq_request(payload, scope)`（**只有 FAQ 用**：拼 project_id/tenantId 查询参数）；
+  mix 两项都直接写在 `mix_retrieve()` 里（普通 POST、三项 body）。
+  **`_body()` 那个「共用骨架」已删**（两边字段已经不同）；原 `_request(url, payload, scope)` 的
+  `url` 是死参数（只剩一个调用点），2026-09-29 收成 `_faq_request()` 并去掉该参数。
+  用户晚间确认「**mix_retrieve 与 faq_retrieve 单次请求的 response 结构相同**」→ 所以
+  **响应解析只有一份**：`_parse()` / `_to_hit()`，两条通道都调它（已实测：同一份同构响应
+  分别走两条通道，命中的 7 个字段逐个一致，含 QA 库的 `chunk.qa_pairs`）。
+  **判据：请求形状可以复制，响应解析不能复制。**
+  注意**请求形状（发几次、body 几个字段、带不带参数/请求头、ranges 怎么发）也属于接口性质**、
+  不是共用规则：mix = 普通 POST + 三项 body + 原样 ranges（见上文），
+  FAQ = 查询参数 + rerank 参数 + 按空间分组。
+  **别为了「两条路长一样」把任一边的形状抄到另一边。**
+  历史坑：两条路各写一份时只给 FAQ 做了按空间分组、`mix_retrieve` 用全局
+  `KB_PROJECT_ID`/`KB_TENANT_ID`，跨空间请求落到错误空间（那时它还是本项目的接口）。
+  `asyncio.gather(return_exceptions=True)` 的顺序与传入一致，`zip(groups, outcomes)`
+  就能把失败组与它的 project_id 一起打进 warning；`mix_retrieve` 只发一次，
+  失败用 `try/except` 降级成空列表（同样只 warning，不抛）。
 - ⚠️ **`FAQ_SIMILARITY_THRESHOLD`（0.98）是按单库相似度调的**，现在 FAQ 也过跨库重排
   （WRRF 分数量纲不同），需要按真实数据重新标定；`_faq_match` 会在未达阈值时 INFO 打出实际最高分。
 - **FAQ 直返附带「其他相近问题」（2026-09-29）**：命中后把本次召回的**其他 QA 命中的
@@ -139,7 +198,8 @@
 - 回归脚本：`scripts/verify_mix_retrieve.py`（`httpx.MockTransport` 进程内 mock 出网，
   覆盖正常链路 / 生成提示词取 `answer_summary` / FAQ 直返 / **直返附三条相近问题** /
   **相近问题不足三条不发** / FAQ 未达阈值 / range 自带空间 /
-  只有切片库不探 FAQ / **未标 knowledge_type 不探 FAQ** / 跨空间分组 / 检索 500 /
+  只有切片库不探 FAQ / **未标 knowledge_type 不探 FAQ** / 跨空间（FAQ 分组 8 次 / 检索只发 1 次）/
+  检索 500 /
   生成模型失败 / 租户未配置 / 整条覆盖 mix 地址 / **FAQ 与检索地址各自覆盖** /
   **用真 `ChatOpenAI` 流式出 token** 共**十六组场景**）。
   **脚本的默认 ranges 必须标 `knowledgeType=2`**，否则 FAQ 探测为 0 次、大量断言假过。
@@ -159,20 +219,37 @@
   `MOCK_CHANNEL=auto|faq|chunk`、`MOCK_FAQ_SCORE`、`MOCK_RELATED_COUNT`、`MOCK_PORT` 可调。
 - `scripts/sync_rag_prompt.py` — 把 `db.sql` 的 rag_prompt 同步进库（唯一受支持的同步方式），
   并负责老表结构（单列 `prompt_content`）就地迁移
+- `scripts/reload_term_mapping.py` — **按 `db.sql` 重建 `rag_keywords_mapping`（2026-09-29 新增）**。
+  从 `db.sql` 原样抽出该表的 `CREATE TABLE` + `INSERT` 两条语句 → DROP + 建表 + 灌数据 →
+  打印行数并用 `TermMapper` 跑替换自检。用项目自己的 async 引擎（本机没 mysql CLI）。
+  跑法 `PYTHONPATH=. .venv/bin/python scripts/reload_term_mapping.py`；**只动术语表**，
+  提示词走 `sync_rag_prompt.py`。跑前先备份（脚本不自动备份）。
 - `app/services/repository.py` — 术语/提示词仓库（TTL 缓存 + 降级）；`PromptRepository.get()`
   返回 `Prompt | None`，`user_content` 为空的行跳过
-- `app/services/knowledge_base.py` — 知识库召回客户端。`faq_retrieve()` / `mix_retrieve()`
-  只是**一行转发**（差在地址与 keywords），真正干活的是 `_retrieve(query, keywords, ranges, url)`：
-  按 `_group_by_space()` 分组 → 组间并发 → 单组失败只 warning → 合并按分数排序。
-  `_payload()` / `_request(url, payload, scope)`（原 `_post`，已合并进来）/ `_to_hit()`；
+- `app/services/knowledge_base.py` — 知识库召回客户端（2026-09-29 拆成两份流程）。
+  `mix_retrieve(query, keywords, ranges)`：**普通 POST**（`client.post(url, json=payload)`，
+  无 header、无 query），body 就三项 `query` / `keywords` / `ranges`，其中 `ranges` 用
+  `model_dump(by_alias=True, exclude_unset=True)` **原样带上门户字段（含 knowledgeType）**，
+  只发一次；失败 `try/except` → warning → `[]`；返回 `list[RetrievalHit]`（按分数降序）。
+  `faq_retrieve(query, ranges)`：`keywords` 恒空、地址 `faq_retrieve_url`，body 由
+  `_faq_body()` 组装（前三项 + `disable_rerank` / `rerank_params`），仍走
+  「`_group_by_space()` 分组 → 组间并发（`_faq_request(payload, scope)` 拼 project_id/tenantId
+  查询参数）→ 单组失败只 warning → 合并排序」。
+  **已无 `_retrieve()` 共用方法**（见上文判据）。**响应解析两条通道共用** ——
+  `_parse()` / `_to_hit()`（用户确认两边 response 结构相同）；其余按通道各一份：
+  `_faq_body()` / `_kb_ranges()`（平台 range 投影）/ `_faq_request()`。
   `KNOWLEDGE_TYPE_QA = 2`；`RetrievalHit.question` 存 QA 命中的问题原文（切片库为 None）。
-  **同一份分组规则同时服务两条通道**（见上）。
   已删的冗余：`SpaceScope` 别名（只出现两次，直接用 `tuple[str, str]`）、
-  `RetrievalHit.raw`（只写不读）。
+  `RetrievalHit.raw`（只写不读）、`_space_of()`（mix 不再需要收敛空间）、
+  `_payload()` → `_faq_body()`、`_body()`（两条通道字段已不同，共用骨架名不副实）、
+  `_request(url, payload, scope)` → `_faq_request(payload, scope)`
+  （`url` 是死参数，且名字看着通用、实际只服务 FAQ）。
   **不再有通用的 `retrieve(query, ranges, target_range)`**（那是死参数），
   **也不再有单库 `_retrieve_faq()`**。
 - `app/models/chat.py` — `KnowledgeRange`（`knowledge_base_id` / `doc_range` / `project_id` /
-  `tenant_id` / `knowledge_type`，后两个用 `AliasChoices` 兼容驼峰与下划线入参）
+  `tenant_id` / `knowledge_type`）。后两个**入参**用 `AliasChoices` 收驼峰与下划线两种写法，
+  **出网**再用 `serialization_alias` 还原成门户驼峰（`tenantId` / `knowledgeType`）——
+  pydantic 的 `validation_alias` 只管入参、不影响序列化（踩过）。
 - `scripts/verify_mix_retrieve.py` — 跨库检索链路回归（进程内 mock 出网，11 组场景）
 - `scripts/verify_message_assembly.py` — 三个场景的消息装配回归（9 组用例）
 - `scripts/verify_repository_loading.py` — 配置表读取层回归（3 组用例：按列名取值、
@@ -248,8 +325,11 @@
     `_faq_direct` 里的润色流、`_TtlStore.get` 里两次「不用打库」的判定）；
   - 不为「以后可能换实现」预留接口/protocol/工厂/包装类；
   - 不加「可能有用」的配置开关与魔数上限（见上文两条）；
-  - 真正需要收敛的**顺序/规则**（直返事件序列、召回的分组与降级）才抽成一个方法，
-    抽的是**语义**不是**代码形状**；
+  - 真正需要收敛的**顺序/规则**（直返事件序列 `_faq_direct`、FAQ 召回的分组与降级）
+    才抽成一个方法，抽的是**语义**不是**代码形状**；
+  - **请求形状（发几次、带不带参数/请求头、ranges 怎么发）属接口性质，不跟着别人抄**：
+    外部接口就按它说的写成普通 POST + 原样 ranges（`mix_retrieve`），
+    别为了两条路对称把 FAQ 的分组/查询参数搬过去，反之亦然；
   - 只写不读的字段、声明了没人用的参数、只出现在一两处的类型别名，都直接删。
   **2026-09-29 整体重构已逐条落地**，删掉的东西不要再加回来：
   `app/services/chat_model.py`、`app/services/stream_agent.py`、
@@ -259,3 +339,14 @@
   判断标准：**能一眼读完、改一处就生效** > 层次整齐。宁可长一点、直白一点。
   重构的配套要求：**先有行为断言脚本**（本项目 4 个脚本 34 组用例），改完原地复跑 +
   起服务打一次 SSE 冒烟，再交给用户；否则「瘦身」会变成改坏行为的借口。
+- ⚠️ **用户会自己改代码并提交**（commit message 一律「第N版」，作者是他本人）。
+  断言变红时**先判断是哪一侧的意图落后，不要默认「测试是对的、代码是坏的」**：
+  - 代码新写、测试还是旧契约 → **更新测试**（2026-09-29 16:05 就是这个情况，我改反了方向，
+    被用户当场抓回：「我修改的yield，你为什么又改回去了」）；
+  - 代码漏实现、测试是文档先行 → 才改代码。
+  判据：`git log -p` / `git show HEAD:<file>` 看改动**是否成套**（整套 SSE 契约一起变 =
+  有意重构；单点遗漏 = 多半是漏实现），并核对时间戳——**提交时间晚于我的编辑的，
+  一律视为用户的有意改动，不碰**。
+  「覆盖 HEAD 跑一遍确认归属」这一步没错，**错在确认完归属后反手把用户拉回旧状态**。
+- **提交前先看 `git status` / `git diff`**：工作区里的改动可能是用户手写的
+  （如 `_faq_direct` 的 yield、`api_key` 的 `or "EMPTY"` 兜底），别当成自己的半成品顺手「修好」。

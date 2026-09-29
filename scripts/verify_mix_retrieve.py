@@ -1,12 +1,17 @@
 """跨库检索 + 单步答案生成链路回归。
 
-用 httpx.MockTransport 在进程内拦掉全部出网请求。FAQ 探测与最终答案检索走的是同一个
-接口（`kbs:mix-retrieve`，请求体与响应结构一致）但**地址各自可覆盖**，脚本按
-「请求体里的 keywords 是否为空」区分二者：空 = FAQ 探测，非空 = 最终答案检索。
+用 httpx.MockTransport 在进程内拦掉全部出网请求。FAQ 探测与最终答案检索打的是同一个接口
+（`kbs:mix-retrieve`，响应结构一致）但**地址与请求体各自独立**，脚本按「body 里有没有
+`disable_rerank`」区分二者：有 = FAQ 探测（平台形状），没有 = 最终答案检索（外部接口的
+普通 POST，只有 query/keywords/ranges 三项）。用形态而不是 keywords 判，改写失败
+（keywords 恰好为空）时也不会误判。
 覆盖十六个场景：
 
-1. 正常链路：ranges 不带空间信息 -> 回落到全局配置；请求地址/查询参数/请求体形状、
+1. 正常链路：ranges 不带空间信息 -> FAQ 那条回落到全局配置；请求地址/请求体形状、
    result[] 解析、SSE 事件顺序、生成阶段按「system 固定指令 + user 含 {query}/{ragkm}」装配消息；
+   同时钉住**两条通道的请求形状不同**：最终检索是普通 POST（无查询参数、无请求头、
+   body 只有 query/keywords/ranges 三项、ranges 原样含门户字段），FAQ 探测带
+   project_id/tenantId 查询参数、body 里还要 disable_rerank/rerank_params；
 2. 生成提示词取 `answer_summary`（并确认不再请求已删除的旧 key）；
 3. FAQ 高置信直返：命中即秒回，不再做最终跨库检索，也不调改写模型；
    FAQ 答案优先取 `chunk.qa_pairs[].answer`；库里没有其他相近问题时**不发** `related_queries`；
@@ -14,20 +19,26 @@
    （`{"queries": [...]}`，库中其他 QA 的问题原文，已排除选中作答的那条；数组顺序即相似度序）；
 5. **相近问题去重去空后凑不满三条**：一条都不发（不是发两条）；
 6. FAQ 分数未达阈值 -> 不直返，继续走完整链路；
-7. **range 自带 project_id/tenantId/knowledgeType=2**：FAQ 探测与最终检索**都**按 range
-   自带的空间分组发请求（空间是请求级查询参数，两条通道共用一个客户端，规则只写一遍）；
+7. **range 自带 project_id/tenantId/knowledgeType=2**：两条通道都**不回落全局配置** ——
+   FAQ 拿它做查询参数，最终检索把整条 range（含 knowledgeType）原样放进 body 的 ranges（见 10）；
 8. **只有 knowledgeType=1 的切片库**：一次 FAQ 都不探，直接进改写与检索；
 9. **range 没带 knowledge_type**：同样一次 FAQ 都不探 —— 未标类型不等于 QA 库；
-10. **两个 QA 库分属两个空间**：FAQ 探测与最终检索都按空间分组，每边各发各的，组内不混库；
+10. **两个 QA 库分属两个空间**：FAQ 探测按空间分组、每边各发各的、组内不混库；最终检索是
+    外部接口的普通 POST，**只发一次**、不分组、不带查询参数，两个库连同各自空间原样进 body；
 11. 混合检索失败（5xx）：降级为「未检索到内容」，不抛异常；
 12. 生成模型失败：回落一句提示语，done 事件照常发出；
-13. 未配置 KB_TENANT_ID：请求不带 tenantId 参数；
-14. 整条覆盖 KB_MIX_RETRIEVE_URL：自定义地址生效；
+13. **range 未带 tenantId**：FAQ 查询参数里只有 project_id（tenantId 没有全局兜底），
+    最终检索也不往 body 塞 tenant（门户没传的字段不会被补成空值）；
+14. 整条覆盖 KB_MIX_RETRIEVE_URL：自定义地址生效，且仍不带查询参数；
 15. **FAQ 地址与最终检索地址各自覆盖**：FAQ 打 FAQ 地址、最终检索打 mix 地址，互不影响；
     未单独配 FAQ 地址时复用 mix 地址（正常链路场景里校验）；
 16. **回答模型用真的 `ChatOpenAI`**（只 mock 它的 HTTP 出口）：验证「直接用 ChatOpenAI」
     这条路真的能流式出 token —— 消息 dict 被正确转换、SSE 被正确解析。其余场景都把模型
     换成假对象，只有这一组守着 langchain 侧的契约。
+
+两条通道的**请求体各写一份**（`mix_retrieve()` 是外部接口、只有三项；`faq_retrieve()` 走
+`_faq_body()`，多出 rerank 参数），但响应解析 `_parse()` / `_to_hit()` 共用，脚本两边都断言，
+避免以后只改了一边。
 
 跑法：PYTHONPATH=. .venv/bin/python scripts/verify_mix_retrieve.py
 """
@@ -190,10 +201,11 @@ def make_handler(
         params = dict(request.url.params)
         body = json.loads(request.content)
         url = str(request.url.copy_with(query=None))
-        # 带 keywords 的是最终答案的跨库检索；不带的是 FAQ 探测（改写前/后各一次）
-        if body.get("keywords"):
+        headers = dict(request.headers)
+        # 带 disable_rerank 的是 FAQ 探测（改写前/后各一次）；只有三项的是最终答案的跨库检索
+        if "disable_rerank" not in body:
             captured.setdefault("mix_calls", []).append(
-                {"url": url, "params": params, "body": body}
+                {"url": url, "params": params, "body": body, "headers": headers}
             )
             captured["mix_url"] = url
             captured["mix_params"] = params
@@ -201,7 +213,9 @@ def make_handler(
             if mix_status != 200:
                 return httpx.Response(mix_status, json={"message": "boom"})
             return httpx.Response(200, json={"result": MIX_RESULT})
-        captured.setdefault("faq_calls", []).append({"url": url, "params": params, "body": body})
+        captured.setdefault("faq_calls", []).append(
+            {"url": url, "params": params, "body": body, "headers": headers}
+        )
         return httpx.Response(200, json={"result": qa_result(qa_score, qa_questions)})
 
     return handler
@@ -254,7 +268,6 @@ async def run_case(
     *,
     qa_score: float = 0.42,
     mix_status: int = 200,
-    tenant_id: str = TENANT,
     ranges: list[dict[str, Any]] | None = None,
     prompts: dict[str, Prompt] | None = None,
     stream_error: Exception | None = None,
@@ -264,7 +277,6 @@ async def run_case(
 ) -> tuple[list[tuple[str, dict]], dict[str, Any], Settings]:
     captured: dict[str, Any] = {}
     settings = Settings(
-        kb_tenant_id=tenant_id,
         answer_model_url="http://model.test/answer/chat/completions",
         **overrides,
     )
@@ -290,7 +302,7 @@ async def run_case(
         {
             "messages": [{"role": "user", "content": RAW_QUERY}],
             # 默认 ranges 标成标准问答库（knowledgeType=2），否则连 FAQ 探测都不会发生；
-            # 空间字段仍留空，用来验证回落全局 KB_PROJECT_ID / KB_TENANT_ID。
+            # 空间字段仍留空：project_id 回落全局 KB_PROJECT_ID，tenantId 直接不带。
             "ranges": ranges
             or [{"knowledge_base_id": KB_ID, "doc_range": [DOC_ID], "knowledgeType": 2}],
         }
@@ -362,26 +374,16 @@ async def case_normal() -> None:
         f"{settings.kb_platform_base_url.rstrip('/')}/applet/api/v1/knowlhub/kbs:mix-retrieve",
     )
     check("最终检索地址", captured.get("mix_url"), settings.mix_retrieve_url)
-    check(
-        "查询参数",
-        captured.get("mix_params"),
-        {"project_id": settings.kb_project_id, "tenantId": TENANT},
-    )
+    check("最终检索不带查询参数（普通 POST）", captured.get("mix_params"), {})
     body = captured.get("mix_body") or {}
     check("body.query", body.get("query"), REWRITTEN)
     check("body.keywords", body.get("keywords"), KEYWORDS)
+    # body 只有三项：外部接口不认识 rerank 相关字段，别照着 FAQ 那条抄
+    check("body 只有 query/keywords/ranges", sorted(body), ["keywords", "query", "ranges"])
     check(
-        "body.ranges",
+        "body.ranges 原样用请求里的 ranges（含门户的 knowledgeType）",
         body.get("ranges"),
-        [{"knowledge_base_id": KB_ID, "doc_range": [DOC_ID]}],
-    )
-    check("body.disable_rerank", body.get("disable_rerank"), False)
-    check("body.rerank_params.top_k", (body.get("rerank_params") or {}).get("top_k"), settings.retrieval_top_k)
-    check("body.rerank_params.weight_type", (body.get("rerank_params") or {}).get("weight_type"), 1)
-    check(
-        "空间信息只走查询参数，不进 range",
-        [key for key in ("project_id", "tenantId", "knowledgeType", "knowledge_type") if key in body["ranges"][0]],
-        [],
+        [{"knowledge_base_id": KB_ID, "doc_range": [DOC_ID], "knowledgeType": 2}],
     )
 
     # FAQ 探测：两轮（改写前 / 改写后），每轮并发两个 query 变体
@@ -390,19 +392,30 @@ async def case_normal() -> None:
     faq_calls = captured.get("faq_calls") or []
     check("FAQ 探测请求数", len(faq_calls), 4)
     check(
+        "两条通道都不带 Authorization（召回接口不拼鉴权头）",
+        {
+            "authorization" in call["headers"]
+            for call in [*captured["mix_calls"], *faq_calls]
+        },
+        {False},
+    )
+    check(
         "FAQ 探测过的 query",
         sorted({call["body"]["query"] for call in faq_calls}),
         sorted({RAW_QUERY, REWRITTEN}),
     )
     check(
-        "FAQ 探测都回落全局空间",
+        "FAQ 探测回落全局 project_id、不带 tenantId",
         {scope_of(call) for call in faq_calls},
-        {json.dumps({"project_id": settings.kb_project_id, "tenantId": TENANT}, sort_keys=True)},
+        {json.dumps({"project_id": settings.kb_project_id}, sort_keys=True)},
     )
     check("FAQ 探测不带 keywords", {tuple(call["body"]["keywords"]) for call in faq_calls}, {()})
     check(
-        "FAQ 探测也只是跨库检索的 body",
-        all("disable_rerank" in call["body"] and "rerank_params" in call["body"] for call in faq_calls),
+        "FAQ 探测（平台接口）body 仍带 disable_rerank/rerank_params",
+        all(
+            call["body"].get("disable_rerank") is False and "rerank_params" in call["body"]
+            for call in faq_calls
+        ),
         True,
     )
     # 未单独配 KB_FAQ_RETRIEVE_URL -> FAQ 地址复用最终检索地址（两通道同端点）
@@ -548,9 +561,8 @@ async def case_faq_threshold() -> None:
 async def case_range_carries_space() -> None:
     """range 自带空间与类型：两条通道都用 range 自带的空间，不回落全局配置。
 
-    空间信息是请求级查询参数、且两条通道共用同一个召回客户端，所以「按
-    (project_id, tenantId) 分组」这条规则只写一遍 —— 这里同时盯住两边，防止以后
-    只改了一边（FAQ 分组、最终检索还是全局），那正是过去踩过的坑。
+    FAQ 那条按 (project_id, tenantId) 分组，所以这里断言 FAQ 请求带的空间就是 range
+    自带的；最终检索是外部接口，整条 range（空间 + knowledgeType）原样进 body。
     """
     ranges = [
         {
@@ -569,9 +581,24 @@ async def case_range_carries_space() -> None:
         {scope_of(call) for call in captured["faq_calls"]},
         {json.dumps(expect, sort_keys=True)},
     )
-    check("最终检索也用 range 自带空间", captured.get("mix_params"), expect)
+    # 最终检索不取查询参数，整条 range 原样进 body（空间 + 类型都在）
+    check("最终检索不带查询参数", captured.get("mix_params"), {})
+    check(
+        "最终检索把整条 range 原样带在 body 里",
+        captured["mix_calls"][0]["body"]["ranges"],
+        [
+            {
+                "knowledge_base_id": KB_ID,
+                "doc_range": [DOC_ID],
+                "project_id": SPACE_A,
+                "tenantId": "tenant-9",
+                "knowledgeType": 2,
+            }
+        ],
+    )
     print(f"    FAQ 参数={[call['params'] for call in captured['faq_calls']]}")
     print(f"    最终检索参数={captured.get('mix_params')}")
+    print(f"    最终检索 ranges={captured['mix_calls'][0]['body']['ranges']}")
 
 
 async def case_slice_only() -> None:
@@ -602,7 +629,7 @@ async def case_missing_type() -> None:
 
 
 async def case_multi_space() -> None:
-    """两个 QA 库分属两个空间：按空间分组，每组各发一次，组内不混库（两条通道都如此）。"""
+    """两个 QA 库分属两个空间：FAQ 按空间分组、每组各发一次、组内不混库；最终检索只发一次。"""
     ranges = [
         {
             "knowledge_base_id": KB_ID,
@@ -635,19 +662,36 @@ async def case_multi_space() -> None:
         )
     check("FAQ 空间 -> 知识库 归属", by_space, {SPACE_A: {KB_ID}, SPACE_B: {KB_ID_2}})
 
-    # 最终检索走同一个客户端的同一条分组规则，两个空间也应各发一次、不混库
+    # 最终检索是外部接口的普通 POST：不分组、**只发一次**、不带查询参数，
+    # ranges 里两个库（连同各自的空间）一起原样发。分组是 FAQ 那条通道自己的事，别抄过来。
     mix_calls = captured.get("mix_calls") or []
-    mix_by_space: dict[str, set[str]] = {}
-    for call in mix_calls:
-        mix_by_space.setdefault(call["params"]["project_id"], set()).update(
-            item["knowledge_base_id"] for item in call["body"]["ranges"]
-        )
-    check("最终检索两空间各发一次", len(mix_calls), 2)
-    check("最终检索 空间 -> 知识库 归属", mix_by_space, {SPACE_A: {KB_ID}, SPACE_B: {KB_ID_2}})
+    check("最终检索只发一次", len(mix_calls), 1)
+    only = mix_calls[0]
+    check("最终检索不带查询参数", only["params"], {})
+    check("最终检索 body 只有三项", sorted(only["body"]), ["keywords", "query", "ranges"])
+    check(
+        "最终检索一次带上全部知识库（含各自空间）",
+        only["body"]["ranges"],
+        [
+            {
+                "knowledge_base_id": KB_ID,
+                "doc_range": [DOC_ID],
+                "project_id": SPACE_A,
+                "tenantId": TENANT,
+                "knowledgeType": 2,
+            },
+            {
+                "knowledge_base_id": KB_ID_2,
+                "project_id": SPACE_B,
+                "tenantId": TENANT,
+                "knowledgeType": 2,
+            },
+        ],
+    )
     print(f"    FAQ 参数={[call['params'] for call in calls]}")
     print(f"    FAQ 分组={ {key: sorted(value) for key, value in by_space.items()} }")
     print(f"    最终检索参数={[call['params'] for call in mix_calls]}")
-    print(f"    最终检索分组={ {key: sorted(value) for key, value in mix_by_space.items()} }")
+    print(f"    最终检索 ranges={only['body']['ranges']}")
 
 
 async def case_mix_down() -> None:
@@ -673,10 +717,16 @@ async def case_generate_down() -> None:
 
 
 async def case_no_tenant() -> None:
-    _, captured, settings = await run_case("未配置租户 id", tenant_id="")
-    check("无 tenantId 时查询参数", captured.get("mix_params"), {"project_id": settings.kb_project_id})
+    """range 不带 tenantId：查询参数只剩 project_id，body 里也不凭空补 tenant 字段。"""
+    _, captured, settings = await run_case("range 未带 tenantId")
+    check("最终检索不带查询参数", captured.get("mix_params"), {})
     check(
-        "FAQ 探测同样不带 tenantId",
+        "最终检索也不往 body 里塞 tenant",
+        [key for key in ("tenantId", "tenant_id") if key in captured["mix_body"]["ranges"][0]],
+        [],
+    )
+    check(
+        "FAQ 探测不带 tenantId 查询参数",
         {scope_of(call) for call in captured["faq_calls"]},
         {json.dumps({"project_id": settings.kb_project_id}, sort_keys=True)},
     )
@@ -687,13 +737,9 @@ async def case_custom_url() -> None:
         "https://10.0.0.9:30443/llm/llmops/tenants/t1/gateway"
         "/applet/api/v1/knowlhub/kbs:mix-retrieve"
     )
-    _, captured, settings = await run_case("整条覆盖接口地址", kb_mix_retrieve_url=custom)
+    _, captured, _ = await run_case("整条覆盖接口地址", kb_mix_retrieve_url=custom)
     check("自定义地址生效", captured.get("mix_url"), custom)
-    check(
-        "自定义地址仍拼 project_id",
-        (captured.get("mix_params") or {}).get("project_id"),
-        settings.kb_project_id,
-    )
+    check("自定义地址也不带查询参数", captured.get("mix_params"), {})
 
 
 async def case_custom_faq_url() -> None:

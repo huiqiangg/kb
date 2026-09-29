@@ -12,14 +12,14 @@ class Settings(BaseSettings):
     # 归档日志保留天数（跨零点后旧文件自动清理）
     log_backup_days: int = 30
     kb_platform_base_url: str = "http://127.0.0.1:8080"
+    # 空间兜底：只给 FAQ 探测那条通道用 —— range 自带 project_id 时以 range 的为准，
+    # 都不带才回落这里。租户没有全局兜底（只认 range 自带的 tenantId）。
     kb_project_id: str = "assets"
-    # 租户 id，留空则请求不带 tenantId 参数
-    kb_tenant_id: str = ""
-    kb_authorization: str = ""
     # 召回接口地址（IP/路径尚未确定）：留空则按 kb_platform_base_url + 平台默认路径推导。
-    # 定了地址后只填这几个，不必改代码；project_id / tenantId 仍会作为查询参数拼上。
-    # FAQ 探测与最终答案检索**请求体与响应结构相同**，但知识库可能不在同一个网关地址上，
-    # 所以两个地址各自可整条覆盖。
+    # 定了地址后只填这几个，不必改代码。
+    # 最终检索是**外部方给的接口**（普通 POST、无鉴权头无查询参数，body 只有三项、
+    # ranges 原样进 body），FAQ 探测走平台接口（project_id/tenantId 查询参数），
+    # 两者形状不同、知识库也可能不在同一个网关上，所以地址各自可整条覆盖。
     kb_mix_retrieve_url: str = ""
     # 留空则复用 kb_mix_retrieve_url（即两通道同地址）
     kb_faq_retrieve_url: str = ""
@@ -83,8 +83,8 @@ class Settings(BaseSettings):
     def faq_retrieve_url(self) -> str:
         """FAQ 探测地址。
 
-        与 `mix_retrieve_url` 是同一个接口的两处部署（请求体与响应结构一致，只是知识库
-        可能挂在不同网关地址上），因此可以各自整条覆盖；FAQ 地址没单独配时复用跨库地址，
+        与 `mix_retrieve_url` 是**同名接口的两处来源**（FAQ 这条按平台文档实现，响应对得上），
+        知识库可能挂在不同网关地址上，因此可以各自整条覆盖；FAQ 地址没单独配时复用跨库地址，
         保持「两通道同端点」这种最常见的情况只需配一个变量。
         """
         return self.kb_faq_retrieve_url or self.mix_retrieve_url

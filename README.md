@@ -16,8 +16,16 @@
 - **不加「可能有用」的配置开关与上限**：如「术语映射开关」（`DB_ENABLED` 已覆盖离线语义）、
   每环节的历史轮次上限（全量传入）。
 - **只有真正需要收敛的顺序 / 规则才抽成一个方法**（FAQ 直返的完整事件序列
-  `RagAgent._faq_direct`、召回的空间分组与降级 `KnowledgeBaseClient._retrieve`）——
-  抽的是**语义**，不是代码形状。
+  `RagAgent._faq_direct`）—— 抽的是**语义**，不是代码形状。
+- **形状相同的请求流程，若来自两个不同提供方的接口，就各写一份**（如 `faq_retrieve()` 与
+  `mix_retrieve()`：`mix-retrieve` 是外部方给的接口，改动要能只落在一处）；
+  而两边**响应结构相同**，解析因此只有一份（`_parse()` / `_to_hit()`）——
+  **请求形状可复制，解析不能复制**，否则会出现「只给一条路改了规则」的静默 bug。
+- **请求形状（发几次、body 有几个字段、带不带参数/请求头）属于接口性质，不跟着别人抄**：
+  `mix-retrieve` 是外部接口，就按对方给的形状写成**普通 POST + 原样 ranges**，body 只有
+  `query` / `keywords` / `ranges` 三项（不带查询参数、不带请求头、不带 rerank 参数）；
+  FAQ 那条仍带 `project_id` / `tenantId` 查询参数、`disable_rerank` /
+  `rerank_params`，并按空间分组。
 
 代码量很小（`app/` 约 1100 行），按「入口 → 编排 → 外部依赖」三块读即可：
 `app/main.py` + `app/routers/chat.py`（HTTP/SSE）→ `app/services/rag_agent.py`（整条问答链路的编排）
@@ -32,20 +40,18 @@ python3.12 -m venv .venv
 .venv/bin/uvicorn app.main:app --reload
 ```
 
-必须配置 `KB_PLATFORM_BASE_URL`、`KB_PROJECT_ID` 和银行环境需要的鉴权信息。模型密钥请放入 `REWRITE_MODEL_KEY` / `ANSWER_MODEL_KEY`，不要提交 `.env`。
+必须配置 `KB_PLATFORM_BASE_URL` 与 `KB_PROJECT_ID`（召回接口目前不拼鉴权头）。模型密钥请放入 `REWRITE_MODEL_KEY` / `ANSWER_MODEL_KEY`，不要提交 `.env`。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `KB_PLATFORM_BASE_URL` | `http://127.0.0.1:8080` | LLMOps 平台根地址 |
-| `KB_PROJECT_ID` | `assets` | 全局兜底 `project_id`（空间）查询参数；`ranges` 自带 `project_id` 时以 range 的为准 |
-| `KB_TENANT_ID` | 空 | 全局兜底 `tenantId`（租户）查询参数，留空则不拼该参数 |
-| `KB_AUTHORIZATION` | 空 | 召回接口鉴权，留空则不拼 `Authorization` 头 |
+| `KB_PROJECT_ID` | `assets` | 全局兜底 `project_id`（空间）查询参数，**只对 FAQ 探测那条通道生效**；`ranges` 自带 `project_id` 时以 range 的为准。`tenantId` 没有全局兜底，只认 `ranges` 自带的 |
 | `KB_MIX_RETRIEVE_URL` | 空 | **跨库召回**接口完整地址（最终答案检索用）；留空按 `{KB_PLATFORM_BASE_URL}/applet/api/v1/knowlhub/kbs:mix-retrieve` 推导 |
 | `KB_FAQ_RETRIEVE_URL` | 空 | **FAQ 探测**接口完整地址；留空复用 `KB_MIX_RETRIEVE_URL` |
 
-**接口 IP 与路径尚未最终确定**，所以召回地址能整条覆盖：定下地址后只改环境变量（或 `.env`），不用动代码。覆盖时 `project_id` / `tenantId` 仍会作为查询参数拼到该地址上。
+**接口 IP 与路径尚未最终确定**，所以召回地址能整条覆盖：定下地址后只改环境变量（或 `.env`），不用动代码。FAQ 探测覆盖时 `project_id` / `tenantId` 仍会作为查询参数拼到该地址上；最终检索不拼查询参数、不带请求头。
 
-FAQ 探测与最终答案检索是**同一个接口的两处部署**（请求体与响应结构完全一致），但 FAQ 知识库不保证挂在同一个网关地址上，因此两个地址各自可整条覆盖；两通道同地址时只配 `KB_MIX_RETRIEVE_URL` 即可。
+FAQ 探测与最终答案检索**曾经是同一个接口的两处部署**，但最终检索现在是**外部方另给的接口**（请求形状不同，见下），地址各自可整条覆盖。
 
 ### 空间与知识库层级
 
@@ -58,11 +64,17 @@ FAQ 探测与最终答案检索是**同一个接口的两处部署**（请求体
 | `tenantId` / `tenant_id` | 租户 id（两种写法都收） |
 | `knowledgeType` / `knowledge_type` | 知识库类型：`1` 切片库，`2` 标准问答（QA）库；**只有显式传 `2` 才算 QA 库**，不传即不参与 FAQ 直返 |
 
-`project_id` / `tenantId` 是**空间级**查询参数而不是全局配置，而 FAQ 探测与最终答案检索走的是
-**同一个召回客户端**，所以「按 `(project_id, tenantId)` 把 ranges 分组、每组各发一次跨库检索」
-这条规则只写一遍（`KnowledgeBaseClient._retrieve`）：**两条通道都按 range 自带的空间走**，
-组内多个知识库共享一次请求与一次重排，组与组之间并发。
-range 不带这两个字段时回落 `KB_PROJECT_ID` / `KB_TENANT_ID`，老请求行为不变。
+两条通道的**请求形状完全不同，别互相抄**：
+
+| 通道 | 请求形状 | body 字段 | ranges 怎么发 |
+| --- | --- | --- | --- |
+| `mix_retrieve()`（`KB_MIX_RETRIEVE_URL`，**外部方提供**） | **普通 POST**：地址 + JSON body，不带查询参数、不带任何请求头 | **只有 `query` / `keywords` / `ranges`** | **原样用请求里的 ranges**（`project_id` / `tenantId` / `knowledgeType` 都带上，外部接口按它定位知识库），一次请求把全部知识库发出去 |
+| `faq_retrieve()`（`KB_FAQ_RETRIEVE_URL`，平台接口） | `project_id` / `tenantId` 查询参数 | 上述三项 + `disable_rerank=false` + `rerank_params` | 只带平台认识的 `knowledge_base_id` / `doc_range`；跨空间时按 `(project_id, tenantId)` 分组、每组各发一次、组间并发 |
+
+两条通道的**请求流程与请求体各写一份**（外部接口契约变化只落在 `mix_retrieve()` 这一处，
+见 `_faq_body()` 与 `mix_retrieve()` 里的 body 字面量）；**响应结构两边相同**（都是 `result[]`
+里同一套命中字段，含 QA 库的 `chunk.qa_pairs`），所以解析只有一份 —— `_parse()` / `_to_hit()`，
+由 `_faq_request()`（平台接口的空间查询参数，只服务 FAQ）与 `mix_retrieve()` 各自调用。
 
 FAQ 直返只对**显式标注 `knowledgeType=2`** 的 range 生效：切片库（1）与未标类型的 range 都不会触发
 FAQ 探测，直接进入改写与跨库检索 —— 「没标类型」不等于「是 QA 库」，放宽会让切片库白跑一次永远不命中的召回。
@@ -82,7 +94,10 @@ mysql -h127.0.0.1 -uroot -p -e "DROP TABLE IF EXISTS kb.rag_keywords_mapping, kb
 mysql -h127.0.0.1 -uroot -p kb < db.sql
 ```
 
-重建后应为 **47 条术语 + 3 条提示词**。
+重建后条数应与 `db.sql` 一致（当前 **44 条术语 + 3 条提示词**）。
+
+> `db.sql` 的 `CREATE TABLE` 列定义末尾**不能有尾逗号**（MySQL 语法，报 `ERROR 1064 ... near ')'`）。
+> 本机没装 `mysql` CLI 时（MySQL 跑在容器里）不必为它装一个 —— 直接用下面的脚本按 `db.sql` 重建。
 
 | 表 | 用途 |
 | --- | --- |
@@ -97,6 +112,14 @@ mysql -h127.0.0.1 -uroot -p kb < db.sql
 ```
 
 同步工具只替换 `db.sql` 中出现的 `prompt_key`，库中多出来的记录保持原样并给出提示；写入后会读回与 `db.sql` 逐字符比对，确认没有被二次转义。老库（单列 `prompt_content`）会先被就地迁移成 `system_content` + `user_content` 再写入。
+
+**术语映射同理，改了 `db.sql` 就重建 `rag_keywords_mapping`**（只动这一张表）：
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/reload_term_mapping.py
+```
+
+脚本从 `db.sql` 原样抽出该表的 `CREATE TABLE` + `INSERT`，DROP 后重建，打印实际行数并用生产解析路径跑一遍替换自检（`房贷能提前还款吗 -> 个人住房贷款能提前还款吗`）。**脚本不自动备份**，重建前建议先导出：`SELECT * FROM rag_keywords_mapping` 存一份即可。服务在跑时进程内缓存（`DB_CACHE_TTL_SECONDS`，默认 300s）会短暂持有旧词表，重启或等 TTL 过期后生效。
 
 **别用 `mysql` 命令行手动拼、或截取 `db.sql` 的片段执行**：提示词正文含大量 `\n` / `\"` 转义，手写命令行会在长字符串处断开（报 `ERROR 1064 ... near '' at line N`），且每条记录只是 `( ... )` 的 values 元组、缺 `INSERT INTO ... VALUES` 前缀。**整份脚本经管道执行没问题**（转义会正确还原、中文不乱码），出问题的只是「截一小段手拼」。只想同步某几条提示词时用上面的 `sync_rag_prompt.py`。
 
@@ -173,19 +196,29 @@ PYTHONPATH=. .venv/bin/python scripts/verify_message_assembly.py
 ## 检索链路
 
 1. **FAQ 直返探测**：先按 `knowledgeType=2` 把 `ranges` 收窄到**标准问答库**（切片库里没有可直接回答的 QA 对，探它只会白跑），再按 `(project_id, tenantId)` 分组，每轮对两个 query 变体（原问题、术语映射后的问题）各发一次**跨库检索** `kbs:mix-retrieve`。最高分 ≥ `FAQ_SIMILARITY_THRESHOLD` 时直接返回库中标准答案（`chunk.qa_pairs[].answer` 优先于 `chunk.content`，经 `answer_polish` 润色后流式下发，`answer_type` 为 `faq`）；改写成功后再探一轮，命中则 `answer_type` 为 `faq_rewrite`。命中时还会把库里**其他相近问题**（同一次召回的 `chunk.qa_pairs[].question`，排除作答那条）凑满 3 条、在 token 流结束后作为一条 `related_queries` 事件下发。
-2. **跨库混合检索**：未命中 FAQ 时先改写 query，随后调用**跨库召回接口** `kbs:mix-retrieve`——同一空间内的全部知识库由一次请求覆盖，结果由平台统一重排（跨空间时按空间拆成多次，见上文）：
+2. **跨库混合检索**：未命中 FAQ 时先改写 query，随后调用**外部方提供的跨库召回接口** `kbs:mix-retrieve`——这是一个**普通 POST**（地址 + JSON body，不带查询参数、不带任何请求头、不需要鉴权），body **只有三项**，`ranges` 里全部知识库由**一次请求**覆盖、结果由对方统一重排：
 
 ```json
 {
   "query": "个人住房贷款可以提前还款吗",
   "keywords": ["房贷", "提前还款"],
-  "ranges": [{"knowledge_base_id": "37c5dwtg4ufbw332", "doc_range": ["ds3523"]}],
-  "disable_rerank": false,
-  "rerank_params": {"top_k": 12, "score_threshold": 0, "weight_type": 1, "full_text_rerank_weight": 0.4}
+  "ranges": [
+    {
+      "knowledge_base_id": "37c5dwtg4ufbw332",
+      "doc_range": ["ds3523"],
+      "project_id": "",
+      "tenantId": "",
+      "knowledgeType": 2
+    }
+  ]
 }
 ```
 
-`query` 用改写结果（改写失败则回落到术语映射结果），`keywords` 是改写同一次调用产出的业务关键词，`ranges` 直接来自请求体。跨库时各知识库相似度度量体系不一致，接口要求重排必须开启，因此固定 `disable_rerank=false` 并携带 `rerank_params`（`weight_type=1` 为动态权重 WRRF，按向量/全文命中名次加权，无需再传 rerank 模型对象）。接口地址取 `KB_MIX_RETRIEVE_URL`（留空则按 `KB_PLATFORM_BASE_URL` 推导），地址定下来前不必改代码。
+`query` 用改写结果（改写失败则回落到术语映射结果），`keywords` 是改写同一次调用产出的业务关键词；
+`ranges` **直接用本次请求的 ranges**（门户传什么发什么，`project_id` / `tenantId` / `knowledgeType`
+都原样进 body，没传的字段不会被补空值）。接口地址取 `KB_MIX_RETRIEVE_URL`（留空则按
+`KB_PLATFORM_BASE_URL` 推导），地址定下来前不必改代码。**这份 body 就是全部**：外部接口不认识
+`disable_rerank` / `rerank_params`（那是 FAQ 探测那条平台通道才要的），别照着抄。
 
 响应取 `result[].chunk.content` 作为正文、`result[].score` 作为得分，另有 `doc_id` / `doc_name` / `knowledge_base_id`，按分数截取 `FINAL_CONTEXT_TOP_K` 条拼成带编号的上下文交给模型。**标准问答库的答案优先取 `chunk.qa_pairs[].answer`**，其次才是 `chunk.content`。检索失败（含知识库不可达、非 2xx）只记一条 warning 并降级为「未检索到内容」（`answer_type` 为 `no_context`），不让检索故障把整条问答链路带崩。
 
@@ -196,9 +229,9 @@ PYTHONPATH=. .venv/bin/python scripts/verify_message_assembly.py
 
 3. **单步生成最终答案**：`answer_generate` 阶段把资料拼成参考上下文，用 `answer_summary` 提示词（留空回落内置 `DEFAULT_SUMMARY_PROMPT`）经 `ChatOpenAI` 流式调用一次产出最终答案，资料注入该提示词 user 段的 `{ragkm}` 占位符，`token` 事件逐字下发后发 `done`。不再有 `answer_polish` 事件。
 
-对应的回归脚本（进程内 mock 出网，覆盖正常链路、提示词 key、FAQ 直返与相近问题、FAQ 未达阈值、
-range 自带空间、只有切片库、未标类型不探 FAQ、跨空间分组（**两条通道都断言**）、检索失败、
-生成失败、租户未配置、两个召回地址各自覆盖、以及**用真 `ChatOpenAI` 跑一遍流式**共十六个场景）：
+对应的回归脚本（进程内 mock 出网，覆盖正常链路、两条通道请求形状、提示词 key、FAQ 直返与相近问题、
+FAQ 未达阈值、range 自带空间、只有切片库、未标类型不探 FAQ、跨空间（FAQ 分组 / 检索只发一次）、
+检索失败、生成失败、租户未配置、两个召回地址各自覆盖、以及**用真 `ChatOpenAI` 跑一遍流式**共十六个场景）：
 
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/verify_mix_retrieve.py
@@ -222,7 +255,8 @@ PYTHONPATH=. .venv/bin/python scripts/verify_mix_retrieve.py
 ```
 
 `ranges` 里只有 `knowledge_base_id` 必填；`project_id` / `tenantId` / `knowledgeType` 由门户带上，
-用于定位空间与判断是否标准问答库。都不传时回落全局 `KB_PROJECT_ID` / `KB_TENANT_ID`；
+用于定位空间与判断是否标准问答库。`project_id` 不传时回落全局 `KB_PROJECT_ID`，`tenantId`
+不传就是不带该参数（没有全局兜底）；
 `knowledgeType` 必须是 `2` 才会走 FAQ 直返，不传或传 `1` 一律跳过 FAQ 探测。
 
 响应为 SSE：`status` 表示处理阶段、`token` 为最终答案增量、`sources` 为检索来源、`related_queries` 为其他相近问题、`done` 表示结束。FAQ 高置信命中的 `done` 事件 `answer_type` 为 `faq`（首轮命中）或 `faq_rewrite`（改写后命中），其答案经润色后流式下发；润色调用失败时回落库中原文。
@@ -286,7 +320,7 @@ tail -f logs/app.log                                      # 跟日志
 知识库 / 模型网关在联调环境常常不可达，用 `scripts/mock_kb_gateway.py` 喂假数据就能跑通整条链路，**不用改一行代码**（零依赖，标准库 `http.server`）：
 
 ```bash
-# 终端 1：假召回网关（FAQ 通道默认返回一条 0.99 的 QA 命中 + 3 条相近问题）
+# 终端 1：假召回网关（房贷标准问答库 6 条，按提问触发词命中一条作答 + 3 条相近问题）
 .venv/bin/python scripts/mock_kb_gateway.py
 
 # 终端 2：主服务把两个召回地址指过去（DB_ENABLED=false 可顺带绕开数据库）
@@ -314,3 +348,16 @@ mock 网关按请求体 `keywords` 是否为空区分通道（空 = FAQ 探测�
 | `MOCK_RELATED_COUNT` | `3` | 相近问题候选条数；设 `2` 可测「凑不满三条 → 一条都不发」 |
 
 FAQ 命中后的答案会走 `answer_polish` 润色，**模型不可达时自动回落库中原文**（按 12 字切块下发），所以没有模型网关也能验证「FAQ 直返 + `related_queries`」的完整事件序列。
+
+假数据是一套**个人住房贷款**标准问答库（脚本里的 `FAQ_LIBRARY`，6 条），按 query / keywords 里出现的**触发词**选中一条作答，其余条目按分数递减充当相近问题候选 —— 换个问法就命中不同条目，不必改代码：
+
+| 这么问 | 命中这条 |
+| --- | --- |
+| 房贷能提前还款吗 | 个人住房贷款可以提前还款吗 |
+| 房贷利率多久调一次 | 房贷利率多久调整一次 |
+| 等额本息和等额本金区别 | 等额本息和等额本金有什么区别 |
+| 公积金能贷多少 | 公积金贷款额度怎么计算 |
+| 房贷逾期会影响征信吗 | 房贷逾期还款会影响征信吗 |
+| 审批通过多久放款 | 房贷审批通过后多久放款 |
+
+触发词一条都不命中时用第 0 条（提前还款）兜底。
