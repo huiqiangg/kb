@@ -79,7 +79,7 @@
   （用户写 user 段时就是这个写法），代码已兼容。
 - 回归脚本：`scripts/verify_message_assembly.py`（9 组用例，含「当前问题只出现一次」不变量）。
 - **FAQ 直返（`if direct`，两个分支都算）同样走 `answer_polish` 润色，且流式下发**（用户要求）。
-  走 `app/services/stream_agent.py` 的 `ChatStreamAgent`，**不传 context**，
+  走 `RagAgent._stream_tokens()`（直接用 `ChatOpenAI.astream`），**不传 context**，
   只装配 `{query}` + `{answer}`（`db.sql` 的 `answer_polish` 也只有这两个占位符）。
   润色失败回落库中原文；这条链路多一次模型调用，已不是「0 次调用秒回」。
 - 标签提取仍用内置提示词（DB 中无对应记录，未给它配 key）。
@@ -118,9 +118,12 @@
   `KB_MIX_RETRIEVE_URL`（最终检索）与 `KB_FAQ_RETRIEVE_URL`（FAQ 探测，留空复用前者）。
   **不要再把 `{base}/applet/api/v1/...` 硬拼在客户端里** —— 用户明确说过地址还没定；
   客户端内部也别写死用 `mix_retrieve_url`，地址作为参数传（`_retrieve(url, payload, scope)`）。
-- ⚠️ **待办**：`mix_retrieve()` 仍用全局 `KB_PROJECT_ID` / `KB_TENANT_ID`，**未按空间分组**，
-  跨空间 ranges 会落到错误的空间（用户本轮明确「先只改 `_faq_probe`」）。修法照
-  `faq_retrieve` 的 `_group_by_space()`，各组并发后合并再统一取 top_k。
+- **两条通道共用同一份分组实现（2026-09-29 已修）**：FAQ 探测与最终检索只差地址与
+  `keywords`，所以内部只有一个 `_retrieve(query, keywords, ranges, url)`，对外两个一行转发的
+  入口。此前两条路各写一份，结果只给 FAQ 做了按空间分组、`mix_retrieve` 仍用全局
+  `KB_PROJECT_ID`/`KB_TENANT_ID`，跨空间请求会落到错误的空间 —— 合并后这类
+  「复制实现只改了一边」的 bug 结构性消失。`asyncio.gather(return_exceptions=True)`
+  的顺序与传入一致，`zip(groups, outcomes)` 就能把失败组与它的 project_id 一起打进 warning。
 - ⚠️ **`FAQ_SIMILARITY_THRESHOLD`（0.98）是按单库相似度调的**，现在 FAQ 也过跨库重排
   （WRRF 分数量纲不同），需要按真实数据重新标定；`_faq_match` 会在未达阈值时 INFO 打出实际最高分。
 - **FAQ 直返附带「其他相近问题」（2026-09-29）**：命中后把本次召回的**其他 QA 命中的
@@ -137,27 +140,37 @@
   覆盖正常链路 / 生成提示词取 `answer_summary` / FAQ 直返 / **直返附三条相近问题** /
   **相近问题不足三条不发** / FAQ 未达阈值 / range 自带空间 /
   只有切片库不探 FAQ / **未标 knowledge_type 不探 FAQ** / 跨空间分组 / 检索 500 /
-  生成模型失败 / 租户未配置 / 整条覆盖 mix 地址 / **FAQ 与检索地址各自覆盖** 共**十五组场景**）。
+  生成模型失败 / 租户未配置 / 整条覆盖 mix 地址 / **FAQ 与检索地址各自覆盖** /
+  **用真 `ChatOpenAI` 流式出 token** 共**十六组场景**）。
   **脚本的默认 ranges 必须标 `knowledgeType=2`**，否则 FAQ 探测为 0 次、大量断言假过。
   注意 FAQ 的请求次数期望：**每轮探测并发两个 query 变体、共两轮**，
   单库单空间 = 4 次请求，跨 2 空间 = 8 次。
+  **测试里替换 `rag_agent.httpx` 要换成副本（`types.SimpleNamespace(**vars(httpx))`），
+  不能直接改 `httpx.AsyncClient` 属性** —— openai SDK 会 `isinstance(client, httpx.AsyncClient)`，
+  把模块属性换成 lambda 会让真模型场景炸 `TypeError: isinstance() arg 2 must be a type`。
 
 ## 关键文件
 - `app/core/db.py` — 异步引擎
 - `app/models/prompt.py` — `Prompt`（`system` + `user` 的 frozen dataclass）
+- `scripts/mock_kb_gateway.py` — **本地假召回网关（联调用）**，零依赖标准库 `http.server`。
+  把 `KB_FAQ_RETRIEVE_URL` / `KB_MIX_RETRIEVE_URL` 指到 `http://127.0.0.1:8099/applet/api/v1/knowlhub/kbs:mix-retrieve`
+  即可让 `_faq_probe` / `mix_retrieve` 拿到假数据，**不用改生产代码**（比硬编码 return 干净，也不会忘删）。
+  默认给「1 条 0.99 的 QA 作答 + 3 条相近问题」，触发 FAQ 直返 + `related_queries`。
+  `MOCK_CHANNEL=auto|faq|chunk`、`MOCK_FAQ_SCORE`、`MOCK_RELATED_COUNT`、`MOCK_PORT` 可调。
 - `scripts/sync_rag_prompt.py` — 把 `db.sql` 的 rag_prompt 同步进库（唯一受支持的同步方式），
   并负责老表结构（单列 `prompt_content`）就地迁移
 - `app/services/repository.py` — 术语/提示词仓库（TTL 缓存 + 降级）；`PromptRepository.get()`
   返回 `Prompt | None`，`user_content` 为空的行跳过
-- `app/services/knowledge_base.py` — 知识库召回客户端：`faq_retrieve()`（FAQ 探测，按空间分组走
-  跨库检索，打到 `settings.faq_retrieve_url`）+ `mix_retrieve()`（最终答案跨库检索，打到
-  `settings.mix_retrieve_url`），共用 `_payload()` / `_retrieve(url, payload, scope)` /
-  `_post()` / `_to_hit()`；`_group_by_space()` 是空间分组规则（range 自带优先，缺省回落 settings）；
-  `KNOWLEDGE_TYPE_QA = 2`；`RetrievalHit.question` 存 QA 命中的问题原文（切片库为 None），
-  供 FAQ 直返的「其他相近问题」用。
+- `app/services/knowledge_base.py` — 知识库召回客户端。`faq_retrieve()` / `mix_retrieve()`
+  只是**一行转发**（差在地址与 keywords），真正干活的是 `_retrieve(query, keywords, ranges, url)`：
+  按 `_group_by_space()` 分组 → 组间并发 → 单组失败只 warning → 合并按分数排序。
+  `_payload()` / `_request(url, payload, scope)`（原 `_post`，已合并进来）/ `_to_hit()`；
+  `KNOWLEDGE_TYPE_QA = 2`；`RetrievalHit.question` 存 QA 命中的问题原文（切片库为 None）。
+  **同一份分组规则同时服务两条通道**（见上）。
+  已删的冗余：`SpaceScope` 别名（只出现两次，直接用 `tuple[str, str]`）、
+  `RetrievalHit.raw`（只写不读）。
   **不再有通用的 `retrieve(query, ranges, target_range)`**（那是死参数），
-  **也不再有单库 `_retrieve_faq()`**；
-  方法名从 `_mix_payload`/`_mix_request` 改成了中性的 `_payload`/`_retrieve` —— 两通道共用。
+  **也不再有单库 `_retrieve_faq()`**。
 - `app/models/chat.py` — `KnowledgeRange`（`knowledge_base_id` / `doc_range` / `project_id` /
   `tenant_id` / `knowledge_type`，后两个用 `AliasChoices` 兼容驼峰与下划线入参）
 - `scripts/verify_mix_retrieve.py` — 跨库检索链路回归（进程内 mock 出网，11 组场景）
@@ -167,26 +180,32 @@
 - `app/services/prompting.py` — 内置兜底提示词（都是 `Prompt`）+ `fill()` +
   **三个场景各自的装配函数**（见上文「配置表读取策略」）
 - `app/services/text_normalizer.py` — `TermMapper`（最长优先单次扫描）
-- `app/services/rewrite_agent.py` — query 改写（langchain `create_agent` + `ChatOpenAI`
-  OpenAI 兼容协议）。模型输出纯 JSON 文本（`rewritten_query`+`keywords`），容错解析；
-  不用 `response_format`/ToolStrategy（内部网关不认 tools）。一次调用同时出改写与关键词，
-  没有单独的标签提取调用。调用是**非流式** `rewrite()`（`ainvoke`），不再有 `rewrite_token` 事件。
-- `app/services/stream_agent.py` — `ChatStreamAgent`：**唯一的流式生成 agent**
-  （langchain `create_agent` + 回答模型 + `astream(stream_mode="messages")`）。
-  **FAQ 直返润色与 RAG 最终答案生成共用它** —— 两者都是「喂 messages、要一段流式文本」，
-  只是提示词不同，拆两个类纯属重复实现（原 `faq_agent.py` 已删）。
-  失败只记 warning 结束，把「降级成什么」留给调用方（FAQ 回落库中原文，RAG 回落一句提示语）。
-- `app/services/rag_agent.py` 的 `_ensure_streamer()` — 惰性取上面那个 agent；
-  原 `_ensure_rewriter` / `_ensure_faq_polisher` 合并成 `_ensure_streamer`（一个就够）。
-- `app/services/chat_model.py` — `build_chat_model()`：ChatOpenAI 的唯一组装处，
-  收敛网关怪癖（base_url 去 `/chat/completions`、api_key 占位、accessKey 头）。
-  **模型地址只有一个来源：每个模型自己的 `*_MODEL_URL`（2026-09-29 定稿）。**
-  曾经有过 `OPENAI_BASE_URL` / `OPENAI_API_KEY` 两个「全局网关地址 / 密钥」变量，
-  **用户要求直接删掉，不要再加回来**：一层「每个模型一条完整 URL」就够，多一层全局覆盖
-  只会制造优先级问题（曾把答案模型带模型 uuid 的路径顶换成改写模型的路径，且不报错）。
-  鉴权：`MODEL_ACCESS_KEY` 同时作 `api_key` 与 `accessKey` 头，留空时 api_key 给 `"EMPTY"`。
-  `ChatStreamAgent.build()` 未配 `ANSWER_MODEL_URL` 即抛 RuntimeError，由调用方降级。
-  回归 `scripts/verify_model_config.py`（4 组）。
+- `app/services/rewrite.py` — 只剩**纯函数**（2026-09-29 拍平后）：`RewriteResult`（dataclass）
+  + `parse_rewrite_json()` + `KEYWORD_LIMIT`。模型输出纯 JSON 文本
+  （`rewritten_query`+`keywords`），容错解析兼容旧字段；不用 `response_format`/ToolStrategy
+  （内部网关不认 tools）。一次调用同时出改写与关键词，没有单独的标签提取调用。
+  **没有客户端、没有类、没有单例** —— 模型与调用都在 `RagAgent` 里
+  （原 `rewrite_agent.py` 的 `QueryRewriteAgent` 类 + `build()` + `create_agent` + 模块单例
+  已全部删除，不要再加回来）。
+- `app/services/rag_agent.py` 的 `_ensure_answer_model()` —— **回答模型的唯一组装点**，
+  惰性创建；`_stream_tokens(messages)` 直接 `ChatOpenAI.astream()` 逐段出文本，
+  **FAQ 直返润色与 RAG 最终答案生成共用它**（两者都是「喂 messages、要一段流式文本」，
+  只是提示词不同）。失败只记 warning 结束，把「降级成什么」留给调用方
+  （FAQ 回落库中原文，RAG 回落一句提示语）。
+- **模型客户端就地组装，没有公共包装层（2026-09-29 定稿，用户明确要求）**：
+  `app/services/chat_model.py`（`build_chat_model()`）、`app/services/stream_agent.py`
+  （`ChatStreamAgent`）、`app/services/rewrite_agent.py`（`QueryRewriteAgent` + `build()` +
+  `create_agent` + 模块单例）**全部已删，不要再加回来**。`ChatOpenAI(...)` 只在两处各写一遍，
+  都在 `RagAgent`：改写在 `_ensure_rewrite_model()`、回答在 `_ensure_answer_model()`。
+  组装规则：base_url 去 `/chat/completions` 后缀；鉴权 `MODEL_ACCESS_KEY` 同时作 `api_key`
+  与 `accessKey` 头，留空时 api_key 给 `"EMPTY"`。
+  **两侧地址留空时都要抛 RuntimeError 并点名变量**（`REWRITE_MODEL_URL` / `ANSWER_MODEL_URL`）——
+  空 base_url 会静默打到 api.openai.com，而两侧失败都只吞成 warning。
+  **地址只有一个来源：每个模型自己的 `*_MODEL_URL`。** 曾有 `OPENAI_BASE_URL`/`OPENAI_API_KEY`
+  两个「全局网关地址/密钥」变量，**用户要求删掉，不要再加回来**（曾把答案模型带模型 uuid 的
+  路径顶换成改写模型的路径，且不报错）。回归 `scripts/verify_model_config.py`（4 组）。
+  剥离 `create_agent` 后 `langchain` / `langgraph*` 不再是直接依赖，
+  `pyproject.toml` 已去掉 `langchain`，`uv lock` 一并清掉 6 个包（111 行）。
 
 ## 约定
 - 助手风格：用户期望直接指出遗漏并执行，不要反复确认。
@@ -195,9 +214,12 @@
   认为 `DB_ENABLED` 已覆盖「离线/降级」这一个语义，再叠一层只是徒增配置面。
 - **不要写死每环节的魔数上限**：用户去掉了 `REWRITE_HISTORY_LIMIT` / `ANSWER_HISTORY_LIMIT`，
   改写拿到全量历史轮次（最终答案生成是单轮，本来不带历史；FAQ 直返润色按设计也不带）。
-- **重资源客户端一律惰性创建**：用户不接受在构造函数里提前建（如 `RagAgent.__init__`
-  里 new 出改写 agent）。构造函数只存注入值，首次真正用到才创建
-  （`_ensure_rewriter()` / `_ensure_streamer()`）。
+- **重资源客户端一律惰性创建，构造参数照旧保留**：用户不接受在构造函数里提前建
+  `ChatOpenAI`，但**接受（且要求）构造函数接收并暂存注入的模型实例**：
+  `self._rewrite_model = rewrite_model` / `self._answer_model = answer_model`
+  （默认 `None` = 尚未创建），由 `_ensure_rewrite_model()` / `_ensure_answer_model()`
+  首次取用时创建。曾把它们改成类属性默认 `None`、`__init__` 不收参数，被用户否掉
+  （原话「算了还是放在构造函数里面吧」）—— 不要再动这两个参数。
 - **一个概念只用一个名字**：惰性创建用**显式方法** `_ensure_xxx()`，不要用与存储字段
   同名的 `@property`。曾写成 property `_rewrite_agent` + 字段 `_rewriter`，
   两个名字指同一对象，用户指出「有点绕」，已改成 `_ensure_*`。
@@ -208,9 +230,28 @@
 - **不要为「过程展示」保留无意义的流式**：改写结果必须完整 JSON 才有用，因此用 `ainvoke`
   非流式一次拿结果；只有最终答案才流式下发。
 - **模型调用一律走 langchain**（用户要求）：不要再写 httpx 直调 `chat/completions` 的
-  模型客户端（原 `model_client.py` 已删）。所有 agent 的 `ChatOpenAI` 组装只经
-  `chat_model.build_chat_model()` 一处。
-- **同类 agent 不要各写一份**：形状相同（喂 messages、拿流式文本）的环节共用一个 agent 类，
-  差异只体现在提示词上；环节数量不等于 agent 数量。
+  模型客户端（原 `model_client.py` 已删）。`ChatOpenAI` 就地组装，**没有公共组装模块**。
+- **抹平重复 ≠ 抽公共模块**（2026-09-29 用户明确否掉）：形状相同的环节共用**方法**
+  （`RagAgent._stream_tokens` 同时服务 FAQ 润色与最终答案生成），不要为此保留一个**类/模块**。
+  用户原话「也不需要包装 ChatStreamAgent，直接使用 `ChatOpenAI(...)` 这种方式」——
+  六行构造参数重复两次，比多一层包装更好维护。
 - **解包数据库行一律按列名，不用位置**（用户明确要求）：`for a, b, c in rows` 在列顺序变化时
   会静默读串，属「能跑但不可靠」的写法。见上文「数据库约定」。
+- **本项目不需要过度封装，直接实现对应功能即可**（2026-09-29 用户原话，总纲）：
+  这是贯穿全项目的默认取向，上面几条「不抽公共模块 / 不包 agent / 不为复用叠抽象层」
+  都是它的具体化。落笔时先问「这层抽象是为谁加的」——
+  - 同形状的重复**就地写第二遍**优于抽基类/工具模块（`ChatOpenAI` 构造、
+    `_faq_direct` 里的润色流、`_TtlStore.get` 里两次「不用打库」的判定）；
+  - 不为「以后可能换实现」预留接口/protocol/工厂/包装类；
+  - 不加「可能有用」的配置开关与魔数上限（见上文两条）；
+  - 真正需要收敛的**顺序/规则**（直返事件序列、召回的分组与降级）才抽成一个方法，
+    抽的是**语义**不是**代码形状**；
+  - 只写不读的字段、声明了没人用的参数、只出现在一两处的类型别名，都直接删。
+  **2026-09-29 整体重构已逐条落地**，删掉的东西不要再加回来：
+  `app/services/chat_model.py`、`app/services/stream_agent.py`、
+  `app/services/rewrite_agent.py`（类 + `build()` + `create_agent` + 模块单例）、
+  8 行的 `app/core/logging.py`、仓库根目录那个 PyCharm 样例 `main.py`、
+  `KnowledgeBaseClient` 的两套同形召回方法、`RetrievalHit.raw`、`SpaceScope` 别名。
+  判断标准：**能一眼读完、改一处就生效** > 层次整齐。宁可长一点、直白一点。
+  重构的配套要求：**先有行为断言脚本**（本项目 4 个脚本 34 组用例），改完原地复跑 +
+  起服务打一次 SSE 冒烟，再交给用户；否则「瘦身」会变成改坏行为的借口。

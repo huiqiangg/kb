@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 
 import httpx
+from langchain_openai import ChatOpenAI
 
 from app.core.config import Settings
 from app.models.chat import ChatCompletionRequest, KnowledgeRange
@@ -23,9 +24,8 @@ from app.services.repository import (
     get_prompt_repository,
     get_term_mapping_repository,
 )
-from app.services.rewrite_agent import QueryRewriteAgent, get_query_rewrite_agent
+from app.services.rewrite import RewriteResult, parse_rewrite_json
 from app.services.sse import sse
-from app.services.stream_agent import ChatStreamAgent, get_chat_stream_agent
 from app.services.text_normalizer import normalize_query
 
 logger = logging.getLogger(__name__)
@@ -38,9 +38,12 @@ TOKEN_CHUNK_SIZE = 12
 FAQ_RELATED_QUERY_COUNT = 3
 
 
-def chunk_text(text: str, size: int = TOKEN_CHUNK_SIZE) -> Iterator[str]:
+def chunk_text(text: str) -> Iterator[str]:
     """把完整答案切块逐段下发。"""
-    return (text[index : index + size] for index in range(0, len(text), size))
+    return (
+        text[index : index + TOKEN_CHUNK_SIZE]
+        for index in range(0, len(text), TOKEN_CHUNK_SIZE)
+    )
 
 
 @dataclass(slots=True)
@@ -62,28 +65,95 @@ class RagAgent:
         settings: Settings,
         term_repository: TermMappingRepository | None = None,
         prompt_repository: PromptRepository | None = None,
-        rewrite_agent: QueryRewriteAgent | None = None,
-        stream_agent: ChatStreamAgent | None = None,
+        rewrite_model: ChatOpenAI | None = None,
+        answer_model: ChatOpenAI | None = None,
     ) -> None:
         self.settings = settings
+        # 仓库有模块级默认实例（`get_*_repository()`），传参是为了测试能塞不达库的假仓库
         self._terms = term_repository or get_term_mapping_repository()
         self._prompts = prompt_repository or get_prompt_repository()
-        # 构造期不建任何模型 agent——FAQ 首轮直返走不到改写、改写失败的请求也用不到
-        # 流式生成，各自首次需要时才创建（见下面两个 _ensure_*），None 表示尚未创建
-        self._rewriter = rewrite_agent
-        self._streamer = stream_agent
+        # 构造期不建任何模型客户端——FAQ 首轮直返走不到改写、改写失败的请求也用不到
+        # 生成，各自首次需要时才创建（见下面两个 _ensure_*），None 表示尚未创建
+        self._rewrite_model = rewrite_model
+        self._answer_model = answer_model
 
-    def _ensure_rewriter(self) -> QueryRewriteAgent:
-        """取改写 agent，首次调用时才创建（构造期建它属于白付初始化代价）。"""
-        if self._rewriter is None:
-            self._rewriter = get_query_rewrite_agent()
-        return self._rewriter
+    def _ensure_rewrite_model(self) -> ChatOpenAI:
+        """取改写模型，首次用到才建（构造期建它属于白付初始化代价）。
 
-    def _ensure_streamer(self) -> ChatStreamAgent:
-        """取流式问答 agent（FAQ 直返润色与最终答案生成共用），首次调用时才创建。"""
-        if self._streamer is None:
-            self._streamer = get_chat_stream_agent()
-        return self._streamer
+        地址取 `REWRITE_MODEL_URL`（去掉 `/chat/completions`：openai 客户端会自己补），
+        鉴权用 `MODEL_ACCESS_KEY`：`api_key` 位置与真实鉴权头 `accessKey` 都用它。
+        **未配地址时抛 RuntimeError**，理由同 `_ensure_answer_model` —— 空 base_url 会静默
+        把问题发到 api.openai.com，而改写失败又只吞成一条 warning，很难发现。
+        """
+        if self._rewrite_model is None:
+            if not self.settings.rewrite_model_url:
+                raise RuntimeError("未配置 REWRITE_MODEL_URL")
+            access_key = self.settings.model_access_key
+            self._rewrite_model = ChatOpenAI(
+                model=self.settings.rewrite_model_name,
+                base_url=self.settings.rewrite_model_url.removesuffix("/chat/completions"),
+                api_key=access_key or "EMPTY",
+                timeout=self.settings.request_timeout_seconds,
+                max_retries=1,
+                default_headers={"accessKey": access_key} if access_key else None,
+            )
+        return self._rewrite_model
+
+    def _ensure_answer_model(self) -> ChatOpenAI:
+        """取回答模型（FAQ 直返润色与最终答案生成共用），首次用到才建。
+
+        就是 `ChatOpenAI(...)` 本身，不再包一层 agent —— 无工具的 agent 除了多一层
+        graph 之外什么都没做，直接用模型的 `astream` 下发增量更直白。
+        地址取 `ANSWER_MODEL_URL`（同样去掉 `/chat/completions`），鉴权同上。
+        **未配地址时抛 RuntimeError** —— 否则 base_url 为空会静默打到 api.openai.com。
+        """
+        if self._answer_model is None:
+            if not self.settings.answer_model_url:
+                raise RuntimeError("未配置 ANSWER_MODEL_URL")
+            access_key = self.settings.model_access_key
+            self._answer_model = ChatOpenAI(
+                model=self.settings.answer_model_name,
+                base_url=self.settings.answer_model_url.removesuffix("/chat/completions"),
+                api_key=access_key or "EMPTY",
+                timeout=self.settings.request_timeout_seconds,
+                max_retries=1,
+                default_headers={"accessKey": access_key} if access_key else None,
+            )
+        return self._answer_model
+
+    async def _rewrite(self, messages: list[dict[str, str]]) -> RewriteResult:
+        """改写 + 关键词提取：**非流式**一次调用，输出约定为纯 JSON 文本。
+
+        改写结果必须拿到完整 JSON 才有用，所以不流式；一次调用同时产出改写与关键词，
+        替代了原来单独的「标签提取」调用。调用失败或输出不可解析都不抛异常 ——
+        返回空结果让调用方用原 query 继续检索，问答链路不中断。
+        """
+        try:
+            message = await self._ensure_rewrite_model().ainvoke(messages)
+        except Exception as exc:  # noqa: BLE001 —— 改写是增强环节，失败不该中断问答
+            logger.warning("query 改写调用失败: %s", exc)
+            return RewriteResult()
+        text = message.content if isinstance(message.content, str) else ""
+        result = parse_rewrite_json(text)
+        if text and not result.rewritten_query:
+            logger.warning("query 改写输出无法解析为结构化结果: %.120s", text)
+        return result
+
+    async def _stream_tokens(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
+        """把 messages 交给回答模型，逐段产出文本。
+
+        与对外的 `stream(request)` 不是一回事：那个是整条问答链路的 SSE 事件流，
+        这里只负责**一次模型调用**。
+        调用失败（含未配地址、网关不可达）只记一条 warning 就结束 —— 降级成什么
+        留给调用方决定（FAQ 直返回落库中原文，RAG 链路回落一句提示语），不在这里替它做主。
+        """
+        try:
+            async for chunk in self._ensure_answer_model().astream(messages):
+                content = chunk.content
+                if isinstance(content, str) and content:
+                    yield content
+        except Exception as exc:  # noqa: BLE001 —— 生成是最后一环，失败不该掀掉整条流
+            logger.warning("模型流式生成失败: %s", exc)
 
     async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[str]:
         query = request.messages[-1].content
@@ -112,15 +182,17 @@ class RagAgent:
                 return
 
             yield sse("status", {"stage": "rewrite", "message": "正在进行问题改写"})
-            understanding_prompt = await self._prompts.get(self.settings.prompt_key_query_understanding)
-            rewrite_messages = build_rewrite_messages(
-                understanding_prompt or DEFAULT_REWRITE_PROMPT,
-                replace_keyword_query,
-                previous_turns,
+            understanding_prompt = await self._prompts.get(
+                self.settings.prompt_key_query_understanding
             )
-            # create_agent（OpenAI 兼容协议）非流式一次调用，同时产出改写与关键词，
-            # 替代原来单独的「标签提取」模型调用；失败时回落原始 query 检索
-            result = await self._ensure_rewriter().rewrite(rewrite_messages)
+            # 改写失败时 result 是空结果，回落术语映射后的 query 检索
+            result = await self._rewrite(
+                build_rewrite_messages(
+                    understanding_prompt or DEFAULT_REWRITE_PROMPT,
+                    replace_keyword_query,
+                    previous_turns,
+                )
+            )
             if result.keywords:
                 yield sse("status", {"stage": "tags_extracted", "tags": result.keywords})
             rewritten = result.rewritten_query
@@ -150,26 +222,25 @@ class RagAgent:
                 yield sse("done", {"answer_type": "no_context"})
                 return
             yield sse("sources", self._sources(sources))
-            context = "\n\n".join(f"[资料{index + 1}] {hit.content}" for index, hit in enumerate(sources))
+            context = "\n\n".join(
+                f"[资料{index + 1}] {hit.content}" for index, hit in enumerate(sources)
+            )
 
             # 最终答案一步到位：提示词取 answer_summary（库里没有则回落内置），
             # 检索到的资料以 {ragkm} 注入该提示词的 user 段。单轮调用，不带对话历史；
-            # 生成即最终答案，不再润色；走 langchain 的流式 agent，token 直接下发。
+            # 生成即最终答案，不再润色；直接走 ChatOpenAI 的流式调用，token 直接下发。
             yield sse("status", {"stage": "answer_generate", "message": "正在生成答案"})
             summary_prompt = await self._prompts.get(self.settings.prompt_key_answer_summary)
             streamed = False
-            try:
-                async for token in self._ensure_streamer().stream(
-                    build_answer_messages(
-                        summary_prompt or DEFAULT_SUMMARY_PROMPT,
-                        query,
-                        context=context,
-                    )
-                ):
-                    streamed = True
-                    yield sse("token", {"content": token})
-            except (httpx.HTTPError, KeyError, ValueError, RuntimeError) as exc:
-                logger.warning("最终答案生成失败: %s", exc)
+            async for token in self._stream_tokens(
+                build_answer_messages(
+                    summary_prompt or DEFAULT_SUMMARY_PROMPT,
+                    query,
+                    context=context,
+                )
+            ):
+                streamed = True
+                yield sse("token", {"content": token})
             if not streamed:
                 yield sse("token", {"content": "未能生成答案，请稍后重试。"})
             yield sse("done", {"answer_type": "rag", "query": rewritten or replace_keyword_query})
@@ -184,49 +255,34 @@ class RagAgent:
     ) -> AsyncIterator[str]:
         """FAQ 直返的完整事件序列：sources → 润色流式 → 相近问题 → done。
 
+        命中 FAQ 说明库里已有人工维护的标准答案，润色只做表达层整理（没有检索知识，
+        也不带对话历史，因此只装配 `answer_polish` 的 `{query}` + `{answer}`）。
+        润色是可选步骤：`_stream_tokens` 内部已经把调用失败吞成空流（含未配置回答模型），
+        这里只需发现「一个字都没吐」就原样回落库中答案，直返链路不会因为润色而整体失败。
+
         相近问题在**探测阶段就已经拿到**（`probe.related_queries`），但要等大模型把答案
-        输出完才能下发 —— 所以它排在 `_stream_faq_answer` 之后，作为**一条** `related_queries`
-        事件把三条一次带走（前端拿到就能整块渲染引导项，不必逐条拼接）。
-        凑不满 3 条时列表为空，一条都不发。
-        两个直返分支（首轮命中 / 改写后命中）只差 `answer_type` 与 `done` 里的 query，
-        共用这里，免得顺序规则在两处各写一遍、日后漏改一处。
+        输出完才能下发 —— 所以它排在 token 流之后，作为**一条** `related_queries` 事件把
+        三条一次带走（前端拿到就能整块渲染引导项，不必逐条拼接）；凑不满 3 条时列表为空，
+        一条都不发。两个直返分支（首轮命中 / 改写后命中）只差 `answer_type` 与 `done` 里的
+        query，共用这里，免得顺序规则在两处各写一遍、日后漏改一处。
         """
         hit = probe.hit
         if hit is None:  # 调用方已判过，这里只是收窄类型
             return
         yield sse("sources", self._sources([hit]))
-        async for event in self._stream_faq_answer(prompt, query, hit):
-            yield event
-        if probe.related_queries:
-            yield sse("related_queries", {"queries": probe.related_queries})
-        yield sse("done", {"answer_type": answer_type, "query": done_query})
-
-    async def _stream_faq_answer(
-        self, prompt: Prompt | None, query: str, hit: RetrievalHit
-    ) -> AsyncIterator[str]:
-        """FAQ 直返的答案润色（create_agent 流式下发）。
-
-        命中 FAQ 说明库里已有人工维护的标准答案，润色只做表达层整理，没有检索知识，
-        也不带对话历史，因此只装配 `answer_polish` 的 system 段与含 `{query}` + `{answer}`
-        的 user 段。
-        润色是可选步骤：调用失败（含未配置回答模型）时原样回落库中答案，
-        直返链路不会因为润色而整体失败。
-        """
         yield sse("status", {"stage": "answer_polish", "message": "正在润色答案"})
-        messages = build_polish_messages(
-            prompt or DEFAULT_POLISH_PROMPT, query, hit.content
-        )
+        messages = build_polish_messages(prompt or DEFAULT_POLISH_PROMPT, query, hit.content)
         streamed = False
-        try:
-            async for token in self._ensure_streamer().stream(messages):
-                streamed = True
-                yield sse("token", {"content": token})
-        except (httpx.HTTPError, KeyError, ValueError, RuntimeError) as exc:
-            logger.warning("FAQ 答案润色失败，回落库中原文: %s", exc)
+        async for token in self._stream_tokens(messages):
+            streamed = True
+            yield sse("token", {"content": token})
         # 已经吐过内容就不重复下发，否则把库中原文切块补上
         if not streamed:
             for piece in chunk_text(hit.content):
                 yield sse("token", {"content": piece})
+        if probe.related_queries:
+            yield sse("related_queries", {"queries": probe.related_queries})
+        yield sse("done", {"answer_type": answer_type, "query": done_query})
 
     async def _faq_probe(
         self, kb: KnowledgeBaseClient, first: str, second: str, ranges: list[KnowledgeRange]
@@ -286,7 +342,9 @@ class RagAgent:
         if best is None or best.score >= self.settings.faq_similarity_threshold:
             return best
         logger.info(
-            "FAQ 最高分 %.4f 未达阈值 %.4f，本次不直返", best.score, self.settings.faq_similarity_threshold
+            "FAQ 最高分 %.4f 未达阈值 %.4f，本次不直返",
+            best.score,
+            self.settings.faq_similarity_threshold,
         )
         return None
 
@@ -303,13 +361,15 @@ class RagAgent:
 
     @staticmethod
     def _sources(hits: list[RetrievalHit]) -> dict:
-        return {"items": [
-            {
-                "knowledge_base_id": item.knowledge_base_id,
-                "doc_id": item.doc_id,
-                "doc_name": item.doc_name,
-                "chunk_id": item.chunk_id,
-                "score": item.score,
-            }
-            for item in hits
-        ]}
+        return {
+            "items": [
+                {
+                    "knowledge_base_id": item.knowledge_base_id,
+                    "doc_id": item.doc_id,
+                    "doc_name": item.doc_name,
+                    "chunk_id": item.chunk_id,
+                    "score": item.score,
+                }
+                for item in hits
+            ]
+        }

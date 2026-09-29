@@ -3,7 +3,7 @@
 用 httpx.MockTransport 在进程内拦掉全部出网请求。FAQ 探测与最终答案检索走的是同一个
 接口（`kbs:mix-retrieve`，请求体与响应结构一致）但**地址各自可覆盖**，脚本按
 「请求体里的 keywords 是否为空」区分二者：空 = FAQ 探测，非空 = 最终答案检索。
-覆盖十五个场景：
+覆盖十六个场景：
 
 1. 正常链路：ranges 不带空间信息 -> 回落到全局配置；请求地址/查询参数/请求体形状、
    result[] 解析、SSE 事件顺序、生成阶段按「system 固定指令 + user 含 {query}/{ragkm}」装配消息；
@@ -14,17 +14,20 @@
    （`{"queries": [...]}`，库中其他 QA 的问题原文，已排除选中作答的那条；数组顺序即相似度序）；
 5. **相近问题去重去空后凑不满三条**：一条都不发（不是发两条）；
 6. FAQ 分数未达阈值 -> 不直返，继续走完整链路；
-7. **range 自带 project_id/tenantId/knowledgeType=2**：FAQ 探测用 range 自带的空间，
-   最终跨库检索仍用全局配置（本轮只改了 `_faq_probe`）；
+7. **range 自带 project_id/tenantId/knowledgeType=2**：FAQ 探测与最终检索**都**按 range
+   自带的空间分组发请求（空间是请求级查询参数，两条通道共用一个客户端，规则只写一遍）；
 8. **只有 knowledgeType=1 的切片库**：一次 FAQ 都不探，直接进改写与检索；
 9. **range 没带 knowledge_type**：同样一次 FAQ 都不探 —— 未标类型不等于 QA 库；
-10. **两个 QA 库分属两个空间**：按空间分组，每个 query 变体各发 2 次请求，组内不混库；
+10. **两个 QA 库分属两个空间**：FAQ 探测与最终检索都按空间分组，每边各发各的，组内不混库；
 11. 混合检索失败（5xx）：降级为「未检索到内容」，不抛异常；
 12. 生成模型失败：回落一句提示语，done 事件照常发出；
 13. 未配置 KB_TENANT_ID：请求不带 tenantId 参数；
 14. 整条覆盖 KB_MIX_RETRIEVE_URL：自定义地址生效；
 15. **FAQ 地址与最终检索地址各自覆盖**：FAQ 打 FAQ 地址、最终检索打 mix 地址，互不影响；
-    未单独配 FAQ 地址时复用 mix 地址（正常链路场景里校验）。
+    未单独配 FAQ 地址时复用 mix 地址（正常链路场景里校验）；
+16. **回答模型用真的 `ChatOpenAI`**（只 mock 它的 HTTP 出口）：验证「直接用 ChatOpenAI」
+    这条路真的能流式出 token —— 消息 dict 被正确转换、SSE 被正确解析。其余场景都把模型
+    换成假对象，只有这一组守着 langchain 侧的契约。
 
 跑法：PYTHONPATH=. .venv/bin/python scripts/verify_mix_retrieve.py
 """
@@ -32,6 +35,7 @@
 import asyncio
 import json
 import sys
+import types
 from typing import Any
 
 import httpx
@@ -41,7 +45,6 @@ from app.core.config import Settings
 from app.models.chat import ChatCompletionRequest
 from app.models.prompt import Prompt
 from app.services.rag_agent import RagAgent
-from app.services.rewrite_agent import RewriteResult
 
 KB_ID = "37c5dwtg4ufbw332"
 KB_ID_2 = "98ab12cd34ef567890abcdef"
@@ -107,28 +110,54 @@ class _PromptRepository:
         return self.prompts.get(key or "")
 
 
-class _Rewriter:
+class _RewriteModel:
+    """替掉改写模型（`ChatOpenAI`）：记录调用次数，回一段固定的 JSON 文本。
+
+    故意回**原始 JSON 字符串**而不是构造好的结果对象 —— 这样脚本会真跑一遍生产代码里的
+    `parse_rewrite_json`，「模型输出纯 JSON 文本 + 容错解析」这条契约不至于没人守。
+    """
+
     def __init__(self, captured: dict[str, Any]) -> None:
         self.captured = captured
 
-    async def rewrite(self, messages: list[dict[str, str]]) -> RewriteResult:
+    async def ainvoke(self, messages: list[dict[str, str]]) -> "_TextReply":
         self.captured["rewrite_calls"] = self.captured.get("rewrite_calls", 0) + 1
-        return RewriteResult(rewritten_query=REWRITTEN, keywords=list(KEYWORDS))
+        return _TextReply(
+            json.dumps({"rewritten_query": REWRITTEN, "keywords": KEYWORDS}, ensure_ascii=False)
+        )
 
 
-class _Streamer:
-    """替掉流式问答 agent（FAQ 润色与最终答案生成共用）：只记录 messages 并吐固定 token。"""
+class _TextReply:
+    """AIMessage 的最小同形替身：生产代码只读 `.content`。"""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
+class _AnswerModel:
+    """替掉回答模型（FAQ 润色与最终答案生成共用一个 ChatOpenAI）：记录 messages、吐固定 token。
+
+    直接实现 `ChatOpenAI.astream` 那一个方法即可 —— 生产代码已经不再包 agent，
+    `RagAgent._stream_tokens()` 拿到的就是模型本身。
+    """
 
     def __init__(self, captured: dict[str, Any], error: Exception | None = None) -> None:
         self.captured = captured
         self.error = error
 
-    async def stream(self, messages: list[dict[str, str]]):
+    async def astream(self, messages: list[dict[str, str]]):
         self.captured.setdefault("answer_messages", []).append(messages)
         if self.error is not None:
             raise self.error
         for token in ANSWER_TOKENS:
-            yield token
+            yield _Chunk(token)
+
+
+class _Chunk:
+    """AIMessageChunk 的最小同形替身：生产代码只读 `.content`。"""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
 
 
 def qa_result(score: float, questions: list[str] | None = None) -> list[dict[str, Any]]:
@@ -191,6 +220,35 @@ def parse(events: list[str]) -> list[tuple[str, dict]]:
     return parsed
 
 
+def sse_chunk(delta: str) -> str:
+    """一段 OpenAI 兼容的流式响应（`data: {...}\\n\\n`）。"""
+    return (
+        "data: "
+        + json.dumps(
+            {
+                "id": "chatcmpl-mock",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "mock",
+                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
+
+
+def make_model_handler(captured: dict[str, Any]):
+    """真 ChatOpenAI 的 HTTP 出口：记录请求体，回一段流式 SSE。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.setdefault("model_requests", []).append(json.loads(request.content))
+        text = "".join(sse_chunk(token) for token in ANSWER_TOKENS) + "data: [DONE]\n\n"
+        return httpx.Response(200, text=text, headers={"Content-Type": "text/event-stream"})
+
+    return handler
+
+
 async def run_case(
     label: str,
     *,
@@ -201,6 +259,7 @@ async def run_case(
     prompts: dict[str, Prompt] | None = None,
     stream_error: Exception | None = None,
     qa_questions: list[str] | None = None,
+    real_model: bool = False,
     **overrides: Any,
 ) -> tuple[list[tuple[str, dict]], dict[str, Any], Settings]:
     captured: dict[str, Any] = {}
@@ -209,12 +268,23 @@ async def run_case(
         answer_model_url="http://model.test/answer/chat/completions",
         **overrides,
     )
+    # real_model：不注入假模型，而是把模块里的 ChatOpenAI 换成「真类 + MockTransport」，
+    # 让 langchain 真的走一遍消息转换与 SSE 解析（其余场景走假模型，快且与 langchain 解耦）
+    model_client: httpx.AsyncClient | None = None
+    real_openai = rag_module.ChatOpenAI
+    answer_model: Any = _AnswerModel(captured, stream_error)
+    if real_model:
+        model_client = httpx.AsyncClient(transport=httpx.MockTransport(make_model_handler(captured)))
+        rag_module.ChatOpenAI = lambda **kwargs: real_openai(  # type: ignore[assignment]
+            **kwargs, http_async_client=model_client
+        )
+        answer_model = None
     agent = RagAgent(
         settings,
         term_repository=_TermRepository(),
         prompt_repository=_PromptRepository(captured, prompts),
-        rewrite_agent=_Rewriter(captured),
-        stream_agent=_Streamer(captured, stream_error),
+        rewrite_model=_RewriteModel(captured),
+        answer_model=answer_model,
     )
     request = ChatCompletionRequest.model_validate(
         {
@@ -225,8 +295,13 @@ async def run_case(
             or [{"knowledge_base_id": KB_ID, "doc_range": [DOC_ID], "knowledgeType": 2}],
         }
     )
-    real_client = rag_module.httpx.AsyncClient
-    rag_module.httpx.AsyncClient = lambda **kwargs: real_client(
+    real_client = httpx.AsyncClient
+    real_httpx = rag_module.httpx
+    # 给 rag_agent 换一个「httpx 副本」而不是直接改 httpx 模块的属性：openai SDK 内部会做
+    # `isinstance(client, httpx.AsyncClient)`，把模块属性换成函数会让它抛
+    # `TypeError: isinstance() arg 2 must be a type ...`（真模型场景踩过这个坑）。
+    shim = types.SimpleNamespace(**vars(real_httpx))
+    shim.AsyncClient = lambda **kwargs: real_client(
         transport=httpx.MockTransport(
             make_handler(
                 captured, qa_score=qa_score, mix_status=mix_status, qa_questions=qa_questions
@@ -234,10 +309,14 @@ async def run_case(
         ),
         **kwargs,
     )
+    rag_module.httpx = shim
     try:
         events = [chunk async for chunk in agent.stream(request)]
     finally:
-        rag_module.httpx.AsyncClient = real_client
+        rag_module.httpx = real_httpx
+        rag_module.ChatOpenAI = real_openai
+        if model_client is not None:
+            await model_client.aclose()
     print(f"--- 场景：{label}")
     return parse(events), captured, settings
 
@@ -467,7 +546,12 @@ async def case_faq_threshold() -> None:
 
 
 async def case_range_carries_space() -> None:
-    """range 自带空间与类型：FAQ 探测用 range 的空间，最终跨库检索仍用全局配置。"""
+    """range 自带空间与类型：两条通道都用 range 自带的空间，不回落全局配置。
+
+    空间信息是请求级查询参数、且两条通道共用同一个召回客户端，所以「按
+    (project_id, tenantId) 分组」这条规则只写一遍 —— 这里同时盯住两边，防止以后
+    只改了一边（FAQ 分组、最终检索还是全局），那正是过去踩过的坑。
+    """
     ranges = [
         {
             "knowledge_base_id": KB_ID,
@@ -477,18 +561,15 @@ async def case_range_carries_space() -> None:
             "knowledgeType": 2,
         }
     ]
-    _, captured, settings = await run_case("QA 库自带空间", ranges=ranges)
+    expect = {"project_id": SPACE_A, "tenantId": "tenant-9"}
+    _, captured, _ = await run_case("QA 库自带空间", ranges=ranges)
 
     check(
         "FAQ 探测用 range 自带空间",
         {scope_of(call) for call in captured["faq_calls"]},
-        {json.dumps({"project_id": SPACE_A, "tenantId": "tenant-9"}, sort_keys=True)},
+        {json.dumps(expect, sort_keys=True)},
     )
-    check(
-        "最终跨库检索仍用全局空间",
-        captured.get("mix_params"),
-        {"project_id": settings.kb_project_id, "tenantId": TENANT},
-    )
+    check("最终检索也用 range 自带空间", captured.get("mix_params"), expect)
     print(f"    FAQ 参数={[call['params'] for call in captured['faq_calls']]}")
     print(f"    最终检索参数={captured.get('mix_params')}")
 
@@ -521,7 +602,7 @@ async def case_missing_type() -> None:
 
 
 async def case_multi_space() -> None:
-    """两个 QA 库分属两个空间：按空间分组，每组各发一次，组内不混库。"""
+    """两个 QA 库分属两个空间：按空间分组，每组各发一次，组内不混库（两条通道都如此）。"""
     ranges = [
         {
             "knowledge_base_id": KB_ID,
@@ -552,9 +633,21 @@ async def case_multi_space() -> None:
         by_space.setdefault(call["params"]["project_id"], set()).update(
             item["knowledge_base_id"] for item in call["body"]["ranges"]
         )
-    check("空间 -> 知识库 归属", by_space, {SPACE_A: {KB_ID}, SPACE_B: {KB_ID_2}})
+    check("FAQ 空间 -> 知识库 归属", by_space, {SPACE_A: {KB_ID}, SPACE_B: {KB_ID_2}})
+
+    # 最终检索走同一个客户端的同一条分组规则，两个空间也应各发一次、不混库
+    mix_calls = captured.get("mix_calls") or []
+    mix_by_space: dict[str, set[str]] = {}
+    for call in mix_calls:
+        mix_by_space.setdefault(call["params"]["project_id"], set()).update(
+            item["knowledge_base_id"] for item in call["body"]["ranges"]
+        )
+    check("最终检索两空间各发一次", len(mix_calls), 2)
+    check("最终检索 空间 -> 知识库 归属", mix_by_space, {SPACE_A: {KB_ID}, SPACE_B: {KB_ID_2}})
     print(f"    FAQ 参数={[call['params'] for call in calls]}")
     print(f"    FAQ 分组={ {key: sorted(value) for key, value in by_space.items()} }")
+    print(f"    最终检索参数={[call['params'] for call in mix_calls]}")
+    print(f"    最终检索分组={ {key: sorted(value) for key, value in mix_by_space.items()} }")
 
 
 async def case_mix_down() -> None:
@@ -632,6 +725,43 @@ async def case_custom_faq_url() -> None:
     print(f"    最终检索地址={captured.get('mix_url')}")
 
 
+async def case_real_model_stream() -> None:
+    """回答模型用**真的** `ChatOpenAI` 流式出 token（只在进程内 mock 掉它的 HTTP 出口）。
+
+    其余场景都把模型换成假对象（跑得快、与 langchain 解耦），代价是没人验证
+    「`ChatOpenAI.astream(messages)` 真的认我们装配的 dict 消息、`chunk.content` 真的是文本」
+    —— 这恰恰是「拆掉包装 agent、直接用 ChatOpenAI」时唯一换掉的契约。
+    这里把真类装回模块里、注入 MockTransport 客户端，端到端跑一遍非 FAQ 链路。
+    """
+    parsed, captured, _ = await run_case(
+        "真 ChatOpenAI 流式出 token",
+        real_model=True,
+        ranges=[{"knowledge_base_id": KB_ID, "doc_range": [DOC_ID], "knowledgeType": 1}],
+    )
+
+    check(
+        "token 事件来自真模型的流式响应",
+        [data["content"] for name, data in parsed if name == "token"],
+        list(ANSWER_TOKENS),
+    )
+    requests = captured.get("model_requests") or []
+    check("模型确实被调用一次", len(requests), 1)
+    body = requests[0] if requests else {}
+    check("HTTP 层开了流式", body.get("stream"), True)
+    check(
+        "消息角色：system（固定指令）+ user（含问题与资料）",
+        [item["role"] for item in body.get("messages", [])],
+        ["system", "user"],
+    )
+    check(
+        "user 段带上了检索资料",
+        CHUNK_TEXT in (body.get("messages", [{}, {}])[1].get("content") or ""),
+        True,
+    )
+    check("answer_type", parsed[-1][1].get("answer_type"), "rag")
+    print(f"    事件序列={names_of(parsed)}")
+
+
 async def main() -> int:
     await case_normal()
     await case_prompt_key()
@@ -648,13 +778,14 @@ async def main() -> int:
     await case_no_tenant()
     await case_custom_url()
     await case_custom_faq_url()
+    await case_real_model_stream()
 
     if FAILURES:
         print("\nFAIL")
         for item in FAILURES:
             print(" -", item)
         return 1
-    print("\nOK  跨库检索 + 单步生成链路十五组场景全部通过")
+    print("\nOK  跨库检索 + 单步生成链路十六组场景全部通过")
     return 0
 
 

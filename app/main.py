@@ -10,11 +10,13 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app.core.config import get_settings
 from app.core.db import get_database
-from app.core.logging import configure_logging
 from app.routers.chat import router as chat_router
 
 settings = get_settings()
-configure_logging(settings.log_level)
+logging.basicConfig(
+    level=settings.log_level.upper(),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 

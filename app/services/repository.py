@@ -62,24 +62,20 @@ class _TtlStore(Generic[T]):
         self._retry_after = 0.0  # 加载失败后的静默窗口截止时刻
         self._lock = asyncio.Lock()
 
-    def _lookup(self, now: float) -> tuple[bool, T]:
-        """命中缓存时返回 `(True, 缓存值)`；需要调 loader 时返回 `(False, 占位值)`。"""
-        if self._value is not None and now < self._expires_at:
-            return True, self._value
-        # 从未成功加载过、且正处在失败静默窗口内：直接降级，不再打库
-        if self._value is None and now < self._retry_after:
-            return True, self._empty
-        return False, self._empty
-
     async def get(self, loader: Callable[[], Awaitable[T]]) -> T:
-        hit, value = self._lookup(time.monotonic())
-        if hit:
-            return value
+        # 两种「这次不用打库」的情况，锁外锁内各判一次（锁内那次是为了捡等锁期间
+        # 别的协程刚填好的值）。判定就写在这里，不再抽成返回元组的 _lookup。
+        now = time.monotonic()
+        if self._value is not None and now < self._expires_at:
+            return self._value
+        if self._value is None and now < self._retry_after:
+            return self._empty
         async with self._lock:
-            # 等锁期间可能已被别的协程填好，锁内再判一次
-            hit, value = self._lookup(time.monotonic())
-            if hit:
-                return value
+            now = time.monotonic()
+            if self._value is not None and now < self._expires_at:
+                return self._value
+            if self._value is None and now < self._retry_after:
+                return self._empty
             try:
                 loaded = await loader()
             except Exception as exc:  # 配置表不可用不应打断问答链路
