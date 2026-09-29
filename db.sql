@@ -1,9 +1,8 @@
 CREATE TABLE rag_keywords_mapping (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+    id BIGINT PRIMARY KEY  AUTO_INCREMENT COMMENT '主键',
     source_term VARCHAR(100) NOT NULL COMMENT '用户术语',
     standard_term VARCHAR(100) NOT NULL COMMENT '银行标准术语',
     enabled TINYINT NOT NULL DEFAULT 1 COMMENT '是否启用：1启用，0禁用',
-    PRIMARY KEY (id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='银行RAG术语映射表';
 
 CREATE TABLE rag_prompt (
@@ -14,7 +13,6 @@ CREATE TABLE rag_prompt (
     user_content TEXT NOT NULL COMMENT '用户提示词：含 {变量} 占位符',
     status TINYINT NOT NULL DEFAULT 1 COMMENT '状态：1启用，0禁用',
     modify_time INT NOT NULL COMMENT '修改时间，Unix时间戳',
-    UNIQUE KEY uk_prompt_key (prompt_key)
 ) COMMENT='RAG提示词配置表';
 
 INSERT INTO rag_keywords_mapping

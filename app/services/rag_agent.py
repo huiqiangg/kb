@@ -7,7 +7,7 @@ import httpx
 from app.core.config import Settings
 from app.models.chat import ChatCompletionRequest, KnowledgeRange
 from app.models.prompt import Prompt
-from app.services.knowledge_base import KnowledgeBaseClient, RetrievalHit
+from app.services.knowledge_base import KNOWLEDGE_TYPE_QA, KnowledgeBaseClient, RetrievalHit
 from app.services.prompting import (
     DEFAULT_POLISH_PROMPT,
     DEFAULT_REWRITE_PROMPT,
@@ -78,15 +78,10 @@ class RagAgent:
         replace_keyword_query = (await self._terms.mapper()).apply(normalized)
         yield sse("status", {"stage": "normalized", "query": replace_keyword_query})
 
-        # 三条提示词优先取库（每条含固定的 system 段与带变量的 user 段）；
-        # DB 无对应 prompt_key 或配置不完整时回落内置。
-        # 改写用 query_understanding，最终答案生成用 answer_summary，FAQ 直返润色用 answer_polish。
-        understanding_prompt, summary_prompt, polish_prompt = await asyncio.gather(
-            self._prompts.get(self.settings.prompt_key_query_understanding),
-            self._prompts.get(self.settings.prompt_key_answer_summary),
-            self._prompts.get(self.settings.prompt_key_answer_polish),
-        )
-
+        # 三条提示词各自在**用到的那条分支**里现取，不提前一次性取好：
+        # FAQ 首轮直返走不到改写提示词，生成失败的请求也没用到润色提示词。
+        # 两个易错点：取库是异步的，必须 await；也不要把结果写成带尾逗号的元组。
+        polish_prompt = await self._prompts.get(self.settings.prompt_key_answer_polish)
         async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
             kb = KnowledgeBaseClient(self.settings, client)
             # 原问题与关键词替换后的问题各探一次 FAQ，高置信命中直接返回库中标准答案。
@@ -99,6 +94,7 @@ class RagAgent:
                 return
 
             yield sse("status", {"stage": "rewrite", "message": "正在进行问题改写"})
+            understanding_prompt = await self._prompts.get(self.settings.prompt_key_query_understanding)
             rewrite_messages = build_rewrite_messages(
                 understanding_prompt or DEFAULT_REWRITE_PROMPT,
                 replace_keyword_query,
@@ -142,6 +138,7 @@ class RagAgent:
             # 检索到的资料以 {ragkm} 注入该提示词的 user 段。单轮调用，不带对话历史；
             # 生成即最终答案，不再润色；走 langchain 的流式 agent，token 直接下发。
             yield sse("status", {"stage": "answer_generate", "message": "正在生成答案"})
+            summary_prompt = await self._prompts.get(self.settings.prompt_key_answer_summary)
             streamed = False
             try:
                 async for token in self._ensure_streamer().stream(
@@ -189,14 +186,36 @@ class RagAgent:
     async def _faq_probe(
         self, kb: KnowledgeBaseClient, first: str, second: str, ranges: list[KnowledgeRange]
     ) -> RetrievalHit | None:
-        """两个 query 变体各召回一次标准问答，返回高置信命中（无命中则为 None）。"""
+        """两个 query 变体各召回一次标准问答，返回高置信命中（无命中则为 None）。
+
+        **只探门户显式标注的标准问答库（`knowledgeType == 2`）**：FAQ 直返靠的是库里
+        人工维护的 QA 对，切片库（1）里没有这种东西，拿它去探只会白跑一次跨库检索。
+        未传 `knowledge_type` 的 range **不视为 QA 库**，「没标类型」和「标了 QA」是两回事 ——
+        按未知保留会让切片库也被拿去当 FAQ 探，等于凭空多一次跨库检索而永远不可能命中。
+        召回本身是跨库检索，由 `KnowledgeBaseClient` 再按 (project_id, tenantId) 分组发请求。
+        """
+        candidates = [item for item in ranges if item.knowledge_type == KNOWLEDGE_TYPE_QA]
+        if not candidates:
+            return None
         first_hits, second_hits = await asyncio.gather(
-            kb.faq_retrieve(first, ranges), kb.faq_retrieve(second, ranges)
+            kb.faq_retrieve(first, candidates), kb.faq_retrieve(second, candidates)
         )
         return self._faq_match(self._dedupe(first_hits + second_hits))
 
     def _faq_match(self, hits: list[RetrievalHit]) -> RetrievalHit | None:
-        return next((item for item in hits if item.score >= self.settings.faq_similarity_threshold and item.content), None)
+        """取最高分命中；未达阈值时不直返，把最高分打进日志便于回调阈值。
+
+        阈值 `FAQ_SIMILARITY_THRESHOLD` 原本是按**单库相似度**调的，现在 FAQ 也走跨库
+        重排（`weight_type=1` 的动态权重 WRRF），分数量纲换了 —— 不记这一行的话，
+        阈值不合适会表现为「FAQ 永远不直返」且没有任何线索。
+        """
+        best = next((item for item in hits if item.content), None)
+        if best is None or best.score >= self.settings.faq_similarity_threshold:
+            return best
+        logger.info(
+            "FAQ 最高分 %.4f 未达阈值 %.4f，本次不直返", best.score, self.settings.faq_similarity_threshold
+        )
+        return None
 
     @staticmethod
     def _dedupe(hits: list[RetrievalHit]) -> list[RetrievalHit]:

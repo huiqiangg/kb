@@ -96,7 +96,8 @@ async def ensure_schema(session) -> str | None:
     迁移后老内容会先落到 system_content，紧接着被 db.sql 的记录整行覆写（见 changed 判定）。
     """
     columns = {
-        row[0] for row in (await session.execute(text("SHOW COLUMNS FROM rag_prompt"))).all()
+        row["Field"]
+        for row in (await session.execute(text("SHOW COLUMNS FROM rag_prompt"))).mappings().all()
     }
     if {"system_content", "user_content"} <= columns:
         return None
@@ -139,8 +140,16 @@ async def run(sql_path: Path, *, dry_run: bool, assume_yes: bool) -> int:
                         "FROM rag_prompt ORDER BY id"
                     )
                 )
-            ).all()
-            current = {row[0]: (row[1], row[2], row[3]) for row in rows}
+            ).mappings().all()
+            # 一律按列名取值，不用位置下标 —— SELECT 的列顺序调整后下标会静默错位
+            current = {
+                row["prompt_key"]: (
+                    row["prompt_name"],
+                    row["system_content"],
+                    row["user_content"],
+                )
+                for row in rows
+            }
 
             print(f"db.sql: {sql_path}")
             print(f"库中现有 {len(current)} 条；db.sql 中 {len(entries)} 条\n")
@@ -207,8 +216,11 @@ async def run(sql_path: Path, *, dry_run: bool, assume_yes: bool) -> int:
                         ),
                         {"key": item["key"]},
                     )
-                ).one()
-                if tuple(stored) != (item["system"], item["user"]):
+                ).mappings().one()
+                if (stored["system_content"], stored["user_content"]) != (
+                    item["system"],
+                    item["user"],
+                ):
                     print(f"✗ {item['key']} 入库后内容与 db.sql 不一致，请检查转义处理")
                     return 1
         print(f"\n✓ 已同步 {len(changed)} 条，且与 db.sql 逐字符一致")

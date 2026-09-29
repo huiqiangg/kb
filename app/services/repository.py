@@ -9,9 +9,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from functools import lru_cache
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from sqlalchemy import text
 
@@ -28,37 +28,75 @@ T = TypeVar("T")
 RETRY_INTERVAL_SECONDS = 30.0
 
 
+def _text_column(row: Mapping[str, Any], name: str) -> str:
+    """按**列名**取一个可空文本列，规整成去掉首尾空白的字符串。
+
+    不要用 `for a, b, c in rows` 这类位置解包：SELECT 的列顺序一调整（或中间插一列），
+    位置解包轻则静默把两列读串、重则 `ValueError`，而报错点离真正的原因很远。
+    按列名取则与 SELECT 的书写顺序解耦 —— 列名写错会直接 `KeyError`，即刻可见。
+    """
+    value = row.get(name)
+    return str(value).strip() if value is not None else ""
+
+
 class _TtlStore(Generic[T]):
-    """带 TTL 与失败降级的进程内缓存，并用锁避免并发重复加载。"""
+    """带 TTL 与失败降级的进程内缓存，并用锁避免并发重复加载。
+
+    同一个 store 的多个并发 `get()` **只会触发一次 loader**（即只查一次库）：
+    缓存未命中时先抢锁，拿到锁后再判一次缓存，只有第一个进来的协程真正加载。
+    所以 `asyncio.gather(prompts.get(a), prompts.get(b), prompts.get(c))`
+    不会打出三条 SQL —— 它们共用同一个 store，而 `_load()` 本来就把整张表读进来，
+    最终只有一条 `SELECT ... FROM rag_prompt`。注意前提是**同一个 repository**：
+    术语表和提示词表是两个独立 store，跨表 gather 会各开一个连接。
+
+    失败静默窗口必须在锁内判定，否则「冷启动 + 库故障」时并发的几个调用会绕过它，
+    挨个去重试 —— 每个都要等满一次 connect_timeout，把首个请求卡到超时叠加。
+    """
 
     def __init__(self, name: str, ttl_seconds: int, empty: T) -> None:
         self._name = name
         self._ttl = max(ttl_seconds, 0)
         self._empty = empty
         self._value: T | None = None
-        self._expires_at = 0.0
+        self._expires_at = 0.0  # 成功值的过期时刻
+        self._retry_after = 0.0  # 加载失败后的静默窗口截止时刻
         self._lock = asyncio.Lock()
 
+    def _lookup(self, now: float) -> tuple[bool, T]:
+        """命中缓存时返回 `(True, 缓存值)`；需要调 loader 时返回 `(False, 占位值)`。"""
+        if self._value is not None and now < self._expires_at:
+            return True, self._value
+        # 从未成功加载过、且正处在失败静默窗口内：直接降级，不再打库
+        if self._value is None and now < self._retry_after:
+            return True, self._empty
+        return False, self._empty
+
     async def get(self, loader: Callable[[], Awaitable[T]]) -> T:
-        if self._value is not None and time.monotonic() < self._expires_at:
-            return self._value
+        hit, value = self._lookup(time.monotonic())
+        if hit:
+            return value
         async with self._lock:
-            if self._value is not None and time.monotonic() < self._expires_at:
-                return self._value
+            # 等锁期间可能已被别的协程填好，锁内再判一次
+            hit, value = self._lookup(time.monotonic())
+            if hit:
+                return value
             try:
-                value = await loader()
+                loaded = await loader()
             except Exception as exc:  # 配置表不可用不应打断问答链路
                 logger.warning("%s 加载失败，本次走降级：%s", self._name, exc)
-                self._expires_at = time.monotonic() + RETRY_INTERVAL_SECONDS
+                self._retry_after = time.monotonic() + RETRY_INTERVAL_SECONDS
                 # 有过成功结果就继续沿用，避免库抖动导致配置瞬间清空
                 return self._value if self._value is not None else self._empty
-            self._value = value
+            self._value = loaded
             self._expires_at = time.monotonic() + self._ttl
-            return value
+            self._retry_after = 0.0
+            return loaded
 
     def invalidate(self) -> None:
+        """显式失效：下次访问立即重新加载，不受失败静默窗口约束。"""
         self._value = None
         self._expires_at = 0.0
+        self._retry_after = 0.0
 
 
 class TermMappingRepository:
@@ -80,11 +118,12 @@ class TermMappingRepository:
 
     async def _load(self) -> TermMapper:
         async with self._database.session() as session:
-            rows = (await session.execute(self._SQL)).all()
-        # 同名术语保留排序中的首条（库中「网银」存在重复行）
+            rows = (await session.execute(self._SQL)).mappings().all()
+        # 同名术语保留排序中的首条（现库无重复行，这里只作兜底）
         mapping: dict[str, str] = {}
-        for source, standard in rows:
-            source_term, standard_term = (source or "").strip(), (standard or "").strip()
+        for row in rows:
+            source_term = _text_column(row, "source_term")
+            standard_term = _text_column(row, "standard_term")
             if source_term and standard_term:
                 mapping.setdefault(source_term, standard_term)
         logger.info("术语映射表已加载：%d 条", len(mapping))
@@ -99,7 +138,7 @@ class PromptRepository:
 
     _SQL = text(
         "SELECT prompt_key, system_content, user_content FROM rag_prompt "
-        "WHERE status = 1 ORDER BY id ASC"
+        "WHERE status = 1 ORDER BY modify_time asc"
     )
 
     def __init__(self, database: Database, ttl_seconds: int) -> None:
@@ -115,19 +154,19 @@ class PromptRepository:
 
     async def _load(self) -> dict[str, Prompt]:
         async with self._database.session() as session:
-            rows = (await session.execute(self._SQL)).all()
+            rows = (await session.execute(self._SQL)).mappings().all()
         prompts: dict[str, Prompt] = {}
-        for key, system, user in rows:
-            name = (str(key) if key else "").strip()
-            body = (str(user) if user else "").strip()
+        for row in rows:
+            name = _text_column(row, "prompt_key")
             if not name:
                 continue
+            user_content = _text_column(row, "user_content")
             # user 段为空等于「问题一个字都没发给模型」，宁可回落内置也不放残缺提示词过去
-            if not body:
+            if not user_content:
                 logger.warning("提示词 %s 的 user_content 为空，跳过并回落内置", name)
                 continue
             prompts[name] = Prompt(
-                system=(str(system) if system else "").strip(), user=body
+                system=_text_column(row, "system_content"), user=user_content
             )
         logger.info("提示词配置表已加载：%s", ", ".join(sorted(prompts)) or "无")
         return prompts

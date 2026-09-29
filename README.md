@@ -16,21 +16,53 @@ python3.12 -m venv .venv
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `KB_PLATFORM_BASE_URL` | `http://127.0.0.1:8080` | LLMOps 平台根地址 |
-| `KB_PROJECT_ID` | `assets` | `project_id` 查询参数 |
-| `KB_TENANT_ID` | 空 | `tenantId` 查询参数，留空则不拼该参数 |
+| `KB_PROJECT_ID` | `assets` | 全局兜底 `project_id`（空间）查询参数；`ranges` 自带 `project_id` 时以 range 的为准 |
+| `KB_TENANT_ID` | 空 | 全局兜底 `tenantId`（租户）查询参数，留空则不拼该参数 |
 | `KB_AUTHORIZATION` | 空 | 召回接口鉴权，留空则不拼 `Authorization` 头 |
-| `KB_FAQ_RETRIEVE_URL` | 空 | **FAQ 单库召回**接口完整地址；留空按 `{KB_PLATFORM_BASE_URL}/applet/api/v1/knowlhub/kbs:retrieve` 推导 |
-| `KB_MIX_RETRIEVE_URL` | 空 | **跨库混合召回**接口完整地址；留空按 `{KB_PLATFORM_BASE_URL}/applet/api/v1/knowlhub/kbs:mix-retrieve` 推导 |
+| `KB_MIX_RETRIEVE_URL` | 空 | **跨库召回**接口完整地址（最终答案检索用）；留空按 `{KB_PLATFORM_BASE_URL}/applet/api/v1/knowlhub/kbs:mix-retrieve` 推导 |
+| `KB_FAQ_RETRIEVE_URL` | 空 | **FAQ 探测**接口完整地址；留空复用 `KB_MIX_RETRIEVE_URL` |
 
-**接口 IP 与路径尚未最终确定**，所以两个召回地址都能整条覆盖：定下地址后只改环境变量（或 `.env`），不用动代码。覆盖时 `project_id` / `tenantId` 仍会作为查询参数拼到该地址上。
+**接口 IP 与路径尚未最终确定**，所以召回地址能整条覆盖：定下地址后只改环境变量（或 `.env`），不用动代码。覆盖时 `project_id` / `tenantId` 仍会作为查询参数拼到该地址上。
+
+FAQ 探测与最终答案检索是**同一个接口的两处部署**（请求体与响应结构完全一致），但 FAQ 知识库不保证挂在同一个网关地址上，因此两个地址各自可整条覆盖；两通道同地址时只配 `KB_MIX_RETRIEVE_URL` 即可。
+
+### 空间与知识库层级
+
+平台侧层级是「租户(`tenantId`) → 空间(`project_id`) → 知识库」，**知识库不支持跨空间检索**。
+门户在每条 `ranges` 项里带上这三个信息：
+
+| 字段 | 含义 |
+| --- | --- |
+| `project_id` | 空间 id |
+| `tenantId` / `tenant_id` | 租户 id（两种写法都收） |
+| `knowledgeType` / `knowledge_type` | 知识库类型：`1` 切片库，`2` 标准问答（QA）库；**只有显式传 `2` 才算 QA 库**，不传即不参与 FAQ 直返 |
+
+`project_id` / `tenantId` 是**空间级**查询参数而不是全局配置，所以 FAQ 探测会先按
+`(project_id, tenantId)` 把 ranges 分组，每组各发一次跨库检索（组内多个 QA 库共享一次请求与一次重排）。
+range 不带这两个字段时回落 `KB_PROJECT_ID` / `KB_TENANT_ID`，老请求行为不变。
+
+FAQ 直返只对**显式标注 `knowledgeType=2`** 的 range 生效：切片库（1）与未标类型的 range 都不会触发
+FAQ 探测，直接进入改写与跨库检索 —— 「没标类型」不等于「是 QA 库」，放宽会让切片库白跑一次永远不命中的召回。
+
+> ⚠️ 最终答案的跨库检索目前**仍用全局 `KB_PROJECT_ID` / `KB_TENANT_ID`**，尚未按空间分组 ——
+> 已知待办，跨空间请求会落到错误的空间。
 
 ## 数据库
 
-术语映射与提示词配置存放在 MySQL，建库建表执行 `db.sql`：
+术语映射与提示词配置存放在 MySQL。`db.sql` 只有 `CREATE TABLE` + `INSERT`，**不含建库与清表语句**：
 
 ```bash
+# 首次：先建库，再整份执行
+mysql -h127.0.0.1 -uroot -p -e "CREATE DATABASE IF NOT EXISTS kb DEFAULT CHARSET utf8mb4"
+mysql -h127.0.0.1 -uroot -p kb < db.sql
+
+# 已有库想按 db.sql 重来：备份 -> 删表 -> 重建
+mysqldump -h127.0.0.1 -uroot -p --databases kb > /tmp/kb_backup_$(date +%Y%m%d_%H%M%S).sql
+mysql -h127.0.0.1 -uroot -p -e "DROP TABLE IF EXISTS kb.rag_keywords_mapping, kb.rag_prompt"
 mysql -h127.0.0.1 -uroot -p kb < db.sql
 ```
+
+重建后应为 **47 条术语 + 3 条提示词**。
 
 | 表 | 用途 |
 | --- | --- |
@@ -46,7 +78,13 @@ mysql -h127.0.0.1 -uroot -p kb < db.sql
 
 同步工具只替换 `db.sql` 中出现的 `prompt_key`，库中多出来的记录保持原样并给出提示；写入后会读回与 `db.sql` 逐字符比对，确认没有被二次转义。老库（单列 `prompt_content`）会先被就地迁移成 `system_content` + `user_content` 再写入。
 
-不要用 `mysql` 命令行截取 `db.sql` 的片段执行：提示词正文含大量 `\n` / `\"` 转义，CLI 逐行解析会在长字符串处断开（报 `ERROR 1064 ... near '' at line N`），且每条记录只是 `( ... )` 的 values 元组、缺 `INSERT INTO ... VALUES` 前缀。整份脚本仍只适合在**空库**上初始化执行。
+**别用 `mysql` 命令行手动拼、或截取 `db.sql` 的片段执行**：提示词正文含大量 `\n` / `\"` 转义，手写命令行会在长字符串处断开（报 `ERROR 1064 ... near '' at line N`），且每条记录只是 `( ... )` 的 values 元组、缺 `INSERT INTO ... VALUES` 前缀。**整份脚本经管道执行没问题**（转义会正确还原、中文不乱码），出问题的只是「截一小段手拼」。只想同步某几条提示词时用上面的 `sync_rag_prompt.py`。
+
+配置表的读取层（`app/services/repository.py`）一律 `.mappings()` 之后**按列名取值**，不用 `for a, b, c in rows` 这类位置解包 —— SELECT 的列顺序一调整（或中间插一列），位置解包会**静默把两列读串**：不报错、不 warning，直到模型拿到的提示词少了变量才会发现。回归脚本：
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/verify_repository_loading.py
+```
 
 相关配置项（见 `.env.example`）：
 
@@ -110,7 +148,7 @@ PYTHONPATH=. .venv/bin/python scripts/verify_message_assembly.py
 
 ## 检索链路
 
-1. **FAQ 直返探测**：原问题与术语映射后的问题各调一次**单库检索** `kbs:retrieve`（`target_range=[2]` 标准问答），最高分 ≥ `FAQ_SIMILARITY_THRESHOLD`（默认 0.98）时直接返回库中标准答案（经 `answer_polish` 润色后流式下发，`answer_type` 为 `faq`）；改写成功后再探一次，命中则 `answer_type` 为 `faq_rewrite`。
+1. **FAQ 直返探测**：先按 `knowledgeType=2` 把 `ranges` 收窄到**标准问答库**（切片库里没有可直接回答的 QA 对，探它只会白跑），再按 `(project_id, tenantId)` 分组，每轮对两个 query 变体（原问题、术语映射后的问题）各发一次**跨库检索** `kbs:mix-retrieve`。最高分 ≥ `FAQ_SIMILARITY_THRESHOLD` 时直接返回库中标准答案（`chunk.qa_pairs[].answer` 优先于 `chunk.content`，经 `answer_polish` 润色后流式下发，`answer_type` 为 `faq`）；改写成功后再探一轮，命中则 `answer_type` 为 `faq_rewrite`。
 2. **跨库混合检索**：未命中 FAQ 时先改写 query，随后调用**跨库召回接口** `kbs:mix-retrieve`——一次请求覆盖 `ranges` 内全部知识库，结果由平台统一重排：
 
 ```json
@@ -127,9 +165,14 @@ PYTHONPATH=. .venv/bin/python scripts/verify_message_assembly.py
 
 响应取 `result[].chunk.content` 作为正文、`result[].score` 作为得分，另有 `doc_id` / `doc_name` / `knowledge_base_id`，按分数截取 `FINAL_CONTEXT_TOP_K` 条拼成带编号的上下文交给模型。检索失败（含知识库不可达、非 2xx）只记一条 warning 并降级为「未检索到内容」（`answer_type` 为 `no_context`），不让检索故障把整条问答链路带崩。
 
+> ⚠️ **`FAQ_SIMILARITY_THRESHOLD` 需要按真实数据重新标定**。它原本是按**单库相似度**调的（默认 0.98），
+> 现在 FAQ 也走跨库重排（`weight_type=1` 的动态权重 WRRF），分数量纲已经不同。阈值不合适会表现为
+> 「FAQ 永远不直返」；`RagAgent._faq_match` 会在最高分没过阈值时打一条 `INFO` 日志带上实际分数，
+> 照日志回调 `FAQ_SIMILARITY_THRESHOLD` 即可。
+
 3. **单步生成最终答案**：`answer_generate` 阶段把资料拼成参考上下文，用 `answer_summary` 提示词（留空回落内置 `DEFAULT_SUMMARY_PROMPT`）经流式 agent 一次调用产出最终答案，资料注入该提示词 user 段的 `{ragkm}` 占位符，`token` 事件逐字下发后发 `done`。不再有 `answer_polish` 事件。
 
-对应的回归脚本（进程内 mock 出网，覆盖正常链路、提示词 key、FAQ 直返、检索失败、生成失败、租户未配置、整条覆盖地址七个场景）：
+对应的回归脚本（进程内 mock 出网，覆盖正常链路、提示词 key、FAQ 直返、FAQ 未达阈值、range 自带空间、只有切片库、跨空间分组、检索失败、生成失败、租户未配置、整条覆盖地址十一个场景）：
 
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/verify_mix_retrieve.py
@@ -140,8 +183,20 @@ PYTHONPATH=. .venv/bin/python scripts/verify_mix_retrieve.py
 ```json
 {
   "messages": [{"role": "user", "content": "个人贷款提前还款怎么办理？"}],
-  "ranges": [{"knowledge_base_id": "37c5dwtg4ufbw332", "doc_range": ["ds3523"]}]
+  "ranges": [
+    {
+      "knowledge_base_id": "37c5dwtg4ufbw332",
+      "doc_range": ["ds3523"],
+      "project_id": "space-a",
+      "tenantId": "tenant-001",
+      "knowledgeType": 2
+    }
+  ]
 }
 ```
+
+`ranges` 里只有 `knowledge_base_id` 必填；`project_id` / `tenantId` / `knowledgeType` 由门户带上，
+用于定位空间与判断是否标准问答库。都不传时回落全局 `KB_PROJECT_ID` / `KB_TENANT_ID`；
+`knowledgeType` 必须是 `2` 才会走 FAQ 直返，不传或传 `1` 一律跳过 FAQ 探测。
 
 响应为 SSE：`status` 表示处理阶段、`token` 为最终答案增量、`sources` 为检索来源、`done` 表示结束。FAQ 高置信命中的 `done` 事件 `answer_type` 为 `faq`（首轮命中）或 `faq_rewrite`（改写后命中），其答案经润色后流式下发；润色调用失败时回落库中原文。

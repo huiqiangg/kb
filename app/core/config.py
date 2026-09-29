@@ -13,9 +13,12 @@ class Settings(BaseSettings):
     kb_tenant_id: str = ""
     kb_authorization: str = ""
     # 召回接口地址（IP/路径尚未确定）：留空则按 kb_platform_base_url + 平台默认路径推导。
-    # 定了地址后只填这两个，不必改代码；project_id / tenantId 仍会作为查询参数拼上。
-    kb_faq_retrieve_url: str = ""
+    # 定了地址后只填这几个，不必改代码；project_id / tenantId 仍会作为查询参数拼上。
+    # FAQ 探测与最终答案检索**请求体与响应结构相同**，但知识库可能不在同一个网关地址上，
+    # 所以两个地址各自可整条覆盖。
     kb_mix_retrieve_url: str = ""
+    # 留空则复用 kb_mix_retrieve_url（即两通道同地址）
+    kb_faq_retrieve_url: str = ""
     rewrite_model_url: str = "http://77.6.65.47:8099/api/model/chat/completions"
     rewrite_model_name: str = "Qwen2.5-coder-7B-Instruct"
     answer_model_url: str = ""
@@ -67,18 +70,21 @@ class Settings(BaseSettings):
         )
 
     @property
-    def faq_retrieve_url(self) -> str:
-        """FAQ（标准问答）召回地址：单库检索 `kbs:retrieve`。"""
-        if self.kb_faq_retrieve_url:
-            return self.kb_faq_retrieve_url
-        return self._platform_url("kbs:retrieve")
-
-    @property
     def mix_retrieve_url(self) -> str:
-        """跨库混合召回地址：跨库检索 `kbs:mix-retrieve`。"""
+        """跨库召回地址：最终答案检索用（`kbs:mix-retrieve`）。"""
         if self.kb_mix_retrieve_url:
             return self.kb_mix_retrieve_url
         return self._platform_url("kbs:mix-retrieve")
+
+    @property
+    def faq_retrieve_url(self) -> str:
+        """FAQ 探测地址。
+
+        与 `mix_retrieve_url` 是同一个接口的两处部署（请求体与响应结构一致，只是知识库
+        可能挂在不同网关地址上），因此可以各自整条覆盖；FAQ 地址没单独配时复用跨库地址，
+        保持「两通道同端点」这种最常见的情况只需配一个变量。
+        """
+        return self.kb_faq_retrieve_url or self.mix_retrieve_url
 
     def _platform_url(self, endpoint: str) -> str:
         base = self.kb_platform_base_url.rstrip("/")
