@@ -1,12 +1,15 @@
 import asyncio
+import json
 import logging
+import time
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import httpx
 from langchain_openai import ChatOpenAI
 
 from app.core.config import Settings
+from app.core.logging import elapsed_ms
 from app.models.chat import ChatCompletionRequest, KnowledgeRange
 from app.models.prompt import Prompt
 from app.services.knowledge_base import KNOWLEDGE_TYPE_QA, KnowledgeBaseClient, RetrievalHit
@@ -157,14 +160,25 @@ class RagAgent:
             logger.warning("模型流式生成失败: %s", exc)
 
     async def stream(self, request: ChatCompletionRequest) -> AsyncIterator[str]:
+        """整条问答链路的 SSE 事件流。
+
+        每个关键节点都在工作做完后打一条日志（耗时 + 关键数据），标识由中间件绑定的
+        trace_id 统一带上，不必在消息里重复。日志只记录、不影响事件序列。
+        """
         query = request.messages[-1].content
         history = [{"role": item.role, "content": item.content} for item in request.messages]
         # 历史轮次不含当前问题，当前问题由消息装配统一放在最后一条 user 消息
         previous_turns = history[:-1]
 
+        started = time.perf_counter()
         normalized = normalize_query(query)
         # 库中关键词（术语）替换；库不可用时映射表为空，替换结果与原问题相同
         replace_keyword_query = (await self._terms.mapper()).apply(normalized)
+        logger.info(
+            "关键词替换 耗时=%.0fms 替换后=%s",
+            elapsed_ms(started),
+            replace_keyword_query,
+        )
         yield sse("status", {"stage": "normalized", "message": "正在进行关键词替换"})
 
         # 三条提示词各自在**用到的那条分支**里现取，不提前一次性取好：
@@ -187,6 +201,7 @@ class RagAgent:
             understanding_prompt = await self._prompts.get(
                 self.settings.prompt_key_query_understanding
             )
+            started = time.perf_counter()
             # 改写失败时 result 是空结果，回落术语映射后的 query 检索
             result = await self._rewrite(
                 build_rewrite_messages(
@@ -196,6 +211,12 @@ class RagAgent:
                 )
             )
             rewritten = result.rewritten_query
+            logger.info(
+                "问题改写 耗时=%.0fms 改写后=%s 关键词=%s",
+                elapsed_ms(started),
+                rewritten or "（无，仍用关键词替换后的问题检索）",
+                result.keywords,
+            )
 
             if rewritten:
                 yield sse("status", {"stage": "faq_second", "query": "二次FAQ检索"})
@@ -213,10 +234,24 @@ class RagAgent:
             yield sse("status", {"stage": "hybrid_retrieval", "message": "正在进行多路混合检索"})
             # 跨库混合检索：改写后的 query 负责语义召回，改写同一次调用产出的 keywords
             # 负责业务词命中；一次请求覆盖 ranges 内全部知识库，结果已由平台重排。
+            started = time.perf_counter()
             hits = await kb.mix_retrieve(
                 rewritten or replace_keyword_query, result.keywords, request.ranges
             )
             sources = hits[: self.settings.final_context_top_k]
+            # 明细整包 JSON：`sources` 是 `RetrievalHit` 列表，逐条 asdict 后一起序列化，
+            # 分数、归属库、文档、切片正文全在 JSON 里，排查「为什么这些资料被采用」够用。
+            logger.info(
+                "跨库混合检索 耗时=%.0fms 命中=%d 采用=%d 明细=%s",
+                elapsed_ms(started),
+                len(hits),
+                len(sources),
+                json.dumps(
+                    [asdict(item) for item in sources],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
             if not sources:
                 yield sse("token", {"content": "未在知识库中检索到可用于回答的内容。"})
                 yield sse("done", {})
@@ -231,7 +266,8 @@ class RagAgent:
             # 生成即最终答案，不再润色；直接走 ChatOpenAI 的流式调用，token 直接下发。
             yield sse("status", {"stage": "answer_generate", "message": "正在生成答案"})
             summary_prompt = await self._prompts.get(self.settings.prompt_key_answer_summary)
-            streamed = False
+            started = time.perf_counter()
+            pieces: list[str] = []
             async for token in self._stream_tokens(
                 build_answer_messages(
                     summary_prompt or DEFAULT_SUMMARY_PROMPT,
@@ -239,10 +275,17 @@ class RagAgent:
                     context=context,
                 )
             ):
-                streamed = True
+                pieces.append(token)
                 yield sse("token", {"content": token})
-            if not streamed:
-                yield sse("token", {"content": "未能生成答案，请稍后重试。"})
+            answer = "".join(pieces)
+            if not answer:
+                answer = "未能生成答案，请稍后重试。"
+                yield sse("token", {"content": answer})
+            logger.info(
+                "answer_summary 耗时=%.0fms 最终结果=%s",
+                elapsed_ms(started),
+                answer,
+            )
             yield sse("done", {"answer_type": "rag", "query": rewritten or replace_keyword_query})
 
     async def _faq_direct(
@@ -271,14 +314,22 @@ class RagAgent:
             return
         yield sse("status", {"stage": "answer_polish", "message": "正在润色答案"})
         messages = build_polish_messages(prompt or DEFAULT_POLISH_PROMPT, query, hit.content)
-        streamed = False
+        started = time.perf_counter()
+        pieces: list[str] = []
         async for token in self._stream_tokens(messages):
-            streamed = True
+            pieces.append(token)
             yield sse("token", {"content": token})
+        polished = "".join(pieces)
         # 已经吐过内容就不重复下发，否则把库中原文切块补上
-        if not streamed:
+        if not polished:
             for piece in chunk_text(hit.content):
                 yield sse("token", {"content": piece})
+        logger.info(
+            "答案润色 耗时=%.0fms 已润色=%s 结果=%s",
+            elapsed_ms(started),
+            bool(polished),
+            polished or hit.content,
+        )
         yield sse("end", {})
         if probe.related_queries:
             yield sse("related_queries", {"queries": probe.related_queries})
@@ -299,17 +350,32 @@ class RagAgent:
         排除选中作答的那条、按分数序去重取 `FAQ_RELATED_QUERY_COUNT` 条，凑不满就给空列表。
         未命中（不直返）时不给相近问题 —— 没有可信答案，光推几个问题没有意义。
         """
+        started = time.perf_counter()
         candidates = [item for item in ranges if item.knowledge_type == KNOWLEDGE_TYPE_QA]
-        if not candidates:
-            return FaqProbeResult()
-        first_hits, second_hits = await asyncio.gather(
-            kb.faq_retrieve(first, candidates), kb.faq_retrieve(second, candidates)
+        hits: list[RetrievalHit] = []
+        result = FaqProbeResult()
+        if candidates:
+            first_hits, second_hits = await asyncio.gather(
+                kb.faq_retrieve(first, candidates), kb.faq_retrieve(second, candidates)
+            )
+            hits = self._dedupe(first_hits + second_hits)
+            matched = self._faq_match(hits)
+            if matched is not None:
+                result = FaqProbeResult(
+                    hit=matched, related_queries=self._related_queries(hits, matched)
+                )
+        # 耗时 + **返回结果整包 JSON**（`FaqProbeResult` 是 dataclass，`asdict` 递归展开，
+        # `hit` 与 `related_queries` 全在 JSON 里，不再逐字段摘要）。
+        # 两个计数 JSON 里没有、但排查「为什么不直返」时正要看：候选库=0 即 ranges 里
+        # 没有 knowledgeType=2 的库（跳过探测），召回=0 即平台一条都没给。
+        logger.info(
+            "FAQ 检索 耗时=%.0fms 候选库=%d 召回=%d 返回=%s",
+            elapsed_ms(started),
+            len(candidates),
+            len(hits),
+            json.dumps(asdict(result), ensure_ascii=False, separators=(",", ":")),
         )
-        hits = self._dedupe(first_hits + second_hits)
-        matched = self._faq_match(hits)
-        if matched is None:
-            return FaqProbeResult()
-        return FaqProbeResult(hit=matched, related_queries=self._related_queries(hits, matched))
+        return result
 
     @staticmethod
     def _related_queries(hits: list[RetrievalHit], matched: RetrievalHit) -> list[str]:

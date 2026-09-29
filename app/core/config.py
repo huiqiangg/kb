@@ -6,7 +6,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     app_name: str = "农商行知识问答 Agent"
+    # ---- 日志：按天切分落文件，每行带请求唯一标识 ----
     log_level: str = "INFO"
+    log_dir: str = "logs"
+    # 归档日志保留天数（跨零点后旧文件自动清理）
+    log_backup_days: int = 30
     kb_platform_base_url: str = "http://127.0.0.1:8080"
     kb_project_id: str = "assets"
     # 租户 id，留空则请求不带 tenantId 参数

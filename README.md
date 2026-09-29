@@ -236,6 +236,51 @@ data: {"queries":["提前还款需要预约吗","提前还款收违约金吗","�
 
 内容是本次召回里**除选中作答那条以外**的其他 QA 问题原文，按相似度排序取 3 条 —— 数组顺序即相似度序。**凑不满 3 条就整段不发**（不会出现 1~2 条的情况），未命中 FAQ 的普通检索回答也不发该事件。
 
+## 日志
+
+日志按天切分写入 `<LOG_DIR>/app.log`（默认 `logs/`），跨零点自动改名归档成 `app.log.<昨天日期>`，保留 `LOG_BACKUP_DAYS` 天（默认 30），控制台同步输出：
+
+```
+2026-09-29 16:45:02 | INFO  | demo-trace-0001 | app.main | 收到请求 method=POST path=/api/kb/chat/completions client=127.0.0.1
+2026-09-29 16:45:02 | INFO  | demo-trace-0001 | app.routers.chat | 问答请求 {"messages":[{"role":"user","content":"房贷能提前还款吗"}],"ranges":[{"knowledge_base_id":"kb-qa-001","doc_range":["ds3523"],"project_id":"assets","tenant_id":"tenant-001","knowledge_type":2}]}
+2026-09-29 16:45:02 | INFO  | demo-trace-0001 | app.services.rag_agent | 关键词替换 耗时=0ms 替换后=房贷能提前还款吗
+2026-09-29 16:45:02 | INFO  | demo-trace-0001 | app.services.rag_agent | FAQ 检索 耗时=4ms 候选库=1 召回=4 返回={"hit":{"content":"个人住房贷款可以提前还款。可通过手机银行「我的贷款」或经办行柜面提交提前还款申请，一般需提前 3 个工作日预约，具体以贷款合同约定为准。","score":0.99,"knowledge_base_id":"kb-qa-001","doc_id":"doc-qa-001","doc_name":"个人贷款 FAQ","chunk_id":"qa-001","question":"个人住房贷款怎么提前还款"},"related_queries":["提前还款需要预约吗","提前还款要收违约金吗","线上能办提前还款吗"]}
+2026-09-29 16:45:04 | INFO  | demo-trace-0001 | app.services.rag_agent | 答案润色 耗时=1280ms 已润色=False 结果=个人住房贷款可以提前还款。可通过手机银行…
+2026-09-29 16:45:04 | INFO  | demo-trace-0001 | app.routers.chat | 问答结束 总耗时=1356ms
+```
+
+第三列是**请求唯一标识**（`trace_id`）：请求进来时由中间件生成（上游带了 `X-Request-ID` 就沿用，并原样回写到响应头），之后同一请求内的每一条日志都自动带上它 —— 拿它 grep 就能把一次问答的完整链路捞出来。上面这段就是 FAQ 直返链路的真实输出（模型网关不可达，所以「已润色=False」并回落库中原文）。
+
+「问答请求」记的是**整包入参 JSON**（`payload.model_dump_json(ensure_ascii=False)`），字段名就是模型里的字段名（`project_id` / `tenant_id` / `knowledge_type`）。`ensure_ascii=False` 保中文可读；序列化保证**单行**（消息内容里带换行会被转义成 `\n`，不会把一条日志撑成两行），所以可以直接管道给 `jq`：
+
+```bash
+tail -f logs/app.log | grep 问答请求 | sed 's/.*| 问答请求 //' | jq -c '.ranges[].knowledge_base_id'
+```
+
+「FAQ 检索」与「跨库混合检索」的返回结果同样是**紧凑单行 JSON**，`=[]` 后面那段直接接 `jq`：
+
+```bash
+grep 跨库混合检索 logs/app.log | sed 's/.*明细=//' | jq -c '.[] | {score, doc_name}'
+```
+
+记录的关键节点（都在工作做完后记一条，含耗时与关键数据）：
+
+| 节点 | 记录内容 |
+| --- | --- |
+| 收到请求 / 问答请求 | method、path、client；**完整请求体 JSON**（messages 全文 + ranges 全字段，单行可直接 jq） |
+| 关键词替换 | 术语替换后的问题（原问题在「问答请求」那条里已有，不重复记） |
+| 问题改写 | 改写后的 query、关键词；改写失败记「无」 |
+| FAQ 检索 | 耗时、候选库数、召回条数、**返回结果整包 JSON**（命中项与相近问题都在里面）；`候选库=0` 即 ranges 里没有 `knowledgeType=2` 的库、跳过探测 |
+| 跨库混合检索 | 耗时、命中条数、采用条数、**采用结果整包 JSON**（每条含 `content` / `score` / `knowledge_base_id` / `doc_id` / `doc_name` / `chunk_id`，单行可直接 jq） |
+| 答案润色 | 是否真的润色过、最终下发的正文（回落库中原文时记原文） |
+| answer_summary | 最终结果正文（`role=user` 请求参数不再重复记 —— 「问答请求」那条 JSON 里已有） |
+| 问答结束 | 整条问答的总耗时（流式响应在中间件那层只等到响应头就绪） |
+
+```bash
+LOG_LEVEL=DEBUG .venv/bin/uvicorn app.main:app --reload   # 调试期看全量
+tail -f logs/app.log                                      # 跟日志
+```
+
 ## 本地联调（mock 召回网关）
 
 知识库 / 模型网关在联调环境常常不可达，用 `scripts/mock_kb_gateway.py` 喂假数据就能跑通整条链路，**不用改一行代码**（零依赖，标准库 `http.server`）：

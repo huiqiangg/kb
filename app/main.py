@@ -1,7 +1,6 @@
 from pathlib import Path
 import logging
 import time
-import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -10,13 +9,11 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from app.core.config import get_settings
 from app.core.db import get_database
+from app.core.logging import bind_trace_id, configure_logging, elapsed_ms, new_trace_id
 from app.routers.chat import router as chat_router
 
 settings = get_settings()
-logging.basicConfig(
-    level=settings.log_level.upper(),
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
+configure_logging(settings.log_dir, settings.log_level, settings.log_backup_days)
 logger = logging.getLogger(__name__)
 
 
@@ -33,15 +30,15 @@ app.include_router(chat_router)
 
 @app.middleware("http")
 async def access_log(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    # 请求一进来就定下唯一标识：同一请求内所有日志（各关键节点、其他模块的 warning）
+    # 都自动带上它；上游带了 X-Request-ID 就沿用，便于跨服务串成一条链路
+    trace_id = bind_trace_id(request.headers.get("X-Request-ID") or new_trace_id())
+    client = request.client.host if request.client else "-"
     started = time.perf_counter()
+    logger.info("收到请求 method=%s path=%s client=%s", request.method, request.url.path, client)
     response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    logger.info(
-        "request_id=%s method=%s path=%s status=%s elapsed_ms=%.1f",
-        request_id, request.method, request.url.path, response.status_code,
-        (time.perf_counter() - started) * 1000,
-    )
+    response.headers["X-Request-ID"] = trace_id
+    logger.info("请求处理完成 status=%s 耗时=%.0fms", response.status_code, elapsed_ms(started))
     return response
 
 
