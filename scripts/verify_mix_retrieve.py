@@ -3,24 +3,27 @@
 用 httpx.MockTransport 在进程内拦掉全部出网请求。FAQ 探测与最终答案检索走的是同一个
 接口（`kbs:mix-retrieve`，请求体与响应结构一致）但**地址各自可覆盖**，脚本按
 「请求体里的 keywords 是否为空」区分二者：空 = FAQ 探测，非空 = 最终答案检索。
-覆盖十三个场景：
+覆盖十五个场景：
 
 1. 正常链路：ranges 不带空间信息 -> 回落到全局配置；请求地址/查询参数/请求体形状、
    result[] 解析、SSE 事件顺序、生成阶段按「system 固定指令 + user 含 {query}/{ragkm}」装配消息；
 2. 生成提示词取 `answer_summary`（并确认不再请求已删除的旧 key）；
 3. FAQ 高置信直返：命中即秒回，不再做最终跨库检索，也不调改写模型；
-   FAQ 答案优先取 `chunk.qa_pairs[].answer`；
-4. FAQ 分数未达阈值 -> 不直返，继续走完整链路；
-5. **range 自带 project_id/tenantId/knowledgeType=2**：FAQ 探测用 range 自带的空间，
+   FAQ 答案优先取 `chunk.qa_pairs[].answer`；库里没有其他相近问题时**不发** `related_queries`；
+4. **FAQ 直返附带三条相近问题**：token 流结束后、`done` 之前发**一条** `related_queries`
+   （`{"queries": [...]}`，库中其他 QA 的问题原文，已排除选中作答的那条；数组顺序即相似度序）；
+5. **相近问题去重去空后凑不满三条**：一条都不发（不是发两条）；
+6. FAQ 分数未达阈值 -> 不直返，继续走完整链路；
+7. **range 自带 project_id/tenantId/knowledgeType=2**：FAQ 探测用 range 自带的空间，
    最终跨库检索仍用全局配置（本轮只改了 `_faq_probe`）；
-6. **只有 knowledgeType=1 的切片库**：一次 FAQ 都不探，直接进改写与检索；
-7. **range 没带 knowledge_type**：同样一次 FAQ 都不探 —— 未标类型不等于 QA 库；
-8. **两个 QA 库分属两个空间**：按空间分组，每个 query 变体各发 2 次请求，组内不混库；
-9. 混合检索失败（5xx）：降级为「未检索到内容」，不抛异常；
-10. 生成模型失败：回落一句提示语，done 事件照常发出；
-11. 未配置 KB_TENANT_ID：请求不带 tenantId 参数；
-12. 整条覆盖 KB_MIX_RETRIEVE_URL：自定义地址生效；
-13. **FAQ 地址与最终检索地址各自覆盖**：FAQ 打 FAQ 地址、最终检索打 mix 地址，互不影响；
+8. **只有 knowledgeType=1 的切片库**：一次 FAQ 都不探，直接进改写与检索；
+9. **range 没带 knowledge_type**：同样一次 FAQ 都不探 —— 未标类型不等于 QA 库；
+10. **两个 QA 库分属两个空间**：按空间分组，每个 query 变体各发 2 次请求，组内不混库；
+11. 混合检索失败（5xx）：降级为「未检索到内容」，不抛异常；
+12. 生成模型失败：回落一句提示语，done 事件照常发出；
+13. 未配置 KB_TENANT_ID：请求不带 tenantId 参数；
+14. 整条覆盖 KB_MIX_RETRIEVE_URL：自定义地址生效；
+15. **FAQ 地址与最终检索地址各自覆盖**：FAQ 打 FAQ 地址、最终检索打 mix 地址，互不影响；
     未单独配 FAQ 地址时复用 mix 地址（正常链路场景里校验）。
 
 跑法：PYTHONPATH=. .venv/bin/python scripts/verify_mix_retrieve.py
@@ -51,6 +54,9 @@ REWRITTEN = "个人住房贷款可以提前还款吗"
 KEYWORDS = ["房贷", "提前还款"]
 CHUNK_TEXT = "借款人可申请提前归还个人住房贷款。"
 FAQ_ANSWER = "可通过手机银行或经办行柜面办理提前还款。"
+FAQ_QUESTION = "个人住房贷款怎么提前还款"
+# 「其他相近问题」用的候选：分数依次低于答案那条，故三条依次被取用
+RELATED_QUESTIONS = ["提前还款需要预约吗", "提前还款收违约金吗", "线上能办提前还款吗"]
 MIX_RESULT = [
     {
         "chunk": {"id": "chunk-1", "content": CHUNK_TEXT},
@@ -125,22 +131,30 @@ class _Streamer:
             yield token
 
 
-def qa_result(score: float) -> list[dict[str, Any]]:
-    """标准问答库的召回结果：正文放在 qa_pairs 里，chunk.content 只是陪衬。"""
+def qa_result(score: float, questions: list[str] | None = None) -> list[dict[str, Any]]:
+    """标准问答库的召回结果：正文放在 qa_pairs 里，chunk.content 只是陪衬。
+
+    给多条 `questions` 就能造出多条 QA 命中（分数按序递减，首条即最高分），
+    用来验证「其他相近问题」的提取与「凑不满三条就不返回」。
+    """
+    questions = questions or [FAQ_QUESTION]
     return [
         {
             "chunk": {
-                "id": "qa-1",
+                "id": f"qa-{index}",
                 "content": "（切片正文，命中 qa_pairs 时不该被使用）",
-                "qa_pairs": [{"question": "个人住房贷款怎么提前还款", "answer": FAQ_ANSWER}],
+                "qa_pairs": [{"question": question, "answer": FAQ_ANSWER}],
             },
-            "score": score,
+            "score": score - index * 0.01,
             "knowledge_base_id": KB_ID,
         }
+        for index, question in enumerate(questions)
     ]
 
 
-def make_handler(captured: dict[str, Any], *, qa_score: float, mix_status: int):
+def make_handler(
+    captured: dict[str, Any], *, qa_score: float, mix_status: int, qa_questions: list[str] | None
+):
     def handler(request: httpx.Request) -> httpx.Response:
         if not request.url.path.endswith("kbs:mix-retrieve"):
             raise AssertionError(f"不该出现的请求：{request.url}")
@@ -159,7 +173,7 @@ def make_handler(captured: dict[str, Any], *, qa_score: float, mix_status: int):
                 return httpx.Response(mix_status, json={"message": "boom"})
             return httpx.Response(200, json={"result": MIX_RESULT})
         captured.setdefault("faq_calls", []).append({"url": url, "params": params, "body": body})
-        return httpx.Response(200, json={"result": qa_result(qa_score)})
+        return httpx.Response(200, json={"result": qa_result(qa_score, qa_questions)})
 
     return handler
 
@@ -186,6 +200,7 @@ async def run_case(
     ranges: list[dict[str, Any]] | None = None,
     prompts: dict[str, Prompt] | None = None,
     stream_error: Exception | None = None,
+    qa_questions: list[str] | None = None,
     **overrides: Any,
 ) -> tuple[list[tuple[str, dict]], dict[str, Any], Settings]:
     captured: dict[str, Any] = {}
@@ -213,7 +228,9 @@ async def run_case(
     real_client = rag_module.httpx.AsyncClient
     rag_module.httpx.AsyncClient = lambda **kwargs: real_client(
         transport=httpx.MockTransport(
-            make_handler(captured, qa_score=qa_score, mix_status=mix_status)
+            make_handler(
+                captured, qa_score=qa_score, mix_status=mix_status, qa_questions=qa_questions
+            )
         ),
         **kwargs,
     )
@@ -399,6 +416,46 @@ async def case_faq_direct() -> None:
         [data["content"] for name, data in parsed if name == "token"],
         list(ANSWER_TOKENS),
     )
+    check("只有一条候选时不给相近问题", "related_queries" in names_of(parsed), False)
+    print(f"    事件序列={names_of(parsed)}")
+
+
+async def case_related_queries() -> None:
+    """FAQ 直返 + 库里另有 3 条相近问题：token 流结束后一条事件带三条。"""
+    parsed, _, _ = await run_case(
+        "FAQ 直返附带三条相近问题", qa_score=0.99, qa_questions=[FAQ_QUESTION, *RELATED_QUESTIONS]
+    )
+    names = names_of(parsed)
+    related = next((data for name, data in parsed if name == "related_queries"), None)
+
+    check("answer_type", parsed[-1][1].get("answer_type"), "faq")
+    check("相近问题三条一次给出、顺序即相似度序", (related or {}).get("queries"), RELATED_QUESTIONS)
+    check(
+        "答案那条不重复出现在相近问题里",
+        FAQ_QUESTION in ((related or {}).get("queries") or []),
+        False,
+    )
+    # 顺序即需求：流式输出全部结束后才发，且必须在 done 之前
+    check(
+        "事件顺序",
+        names,
+        ["status", "sources", "status", "token", "token", "related_queries", "done"],
+    )
+    print(f"    事件序列={names}")
+    print(f"    相近问题={(related or {}).get('queries')}")
+
+
+async def case_related_queries_short() -> None:
+    """候选去重/去空之后凑不满三条：一条都不发（不是发两条）。"""
+    parsed, _, _ = await run_case(
+        "相近问题不足三条不发",
+        qa_score=0.99,
+        # 答案那条 + 一条有效 + 一条重复 + 一条空问题
+        qa_questions=[FAQ_QUESTION, RELATED_QUESTIONS[0], RELATED_QUESTIONS[0], ""],
+    )
+
+    check("不足三条不发相近问题", "related_queries" in names_of(parsed), False)
+    check("answer_type", parsed[-1][1].get("answer_type"), "faq")
     print(f"    事件序列={names_of(parsed)}")
 
 
@@ -579,6 +636,8 @@ async def main() -> int:
     await case_normal()
     await case_prompt_key()
     await case_faq_direct()
+    await case_related_queries()
+    await case_related_queries_short()
     await case_faq_threshold()
     await case_range_carries_space()
     await case_slice_only()
@@ -595,7 +654,7 @@ async def main() -> int:
         for item in FAILURES:
             print(" -", item)
         return 1
-    print("\nOK  跨库检索 + 单步生成链路十三组场景全部通过")
+    print("\nOK  跨库检索 + 单步生成链路十五组场景全部通过")
     return 0
 
 

@@ -46,6 +46,9 @@ class RetrievalHit:
     doc_name: str | None
     chunk_id: str | None
     raw: dict[str, Any]
+    # 标准问答库命中时该 QA 对的问题原文（切片库命中为 None）。
+    # 命中答案走 `content`，这里留着给「其他相近问题」用。
+    question: str | None = None
 
 
 class KnowledgeBaseClient:
@@ -183,7 +186,9 @@ class KnowledgeBaseClient:
         # 标准问答库的命中可能承载在 qa_pairs 中，优先保留可直接回答的答案。
         qa_pairs = chunk.get("qa_pairs") or []
         if qa_pairs:
-            answer = qa_pairs[0].get("answer") or qa_pairs[0].get("a")
+            pair = qa_pairs[0]
+            answer = pair.get("answer") or pair.get("a")
             if answer:
                 hit.content = answer
+            hit.question = pair.get("question") or pair.get("q") or None
         return hit

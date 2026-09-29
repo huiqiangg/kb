@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass, field
 
 import httpx
 
@@ -32,10 +33,27 @@ logger = logging.getLogger(__name__)
 # 最终答案按该长度切块下发，前端保持逐字输出观感
 TOKEN_CHUNK_SIZE = 12
 
+# FAQ 直返后附带「其他相近问题」的条数：**固定 3 条，不够就一条都不给**。
+# 需求就是「凑不满三条不返回」，所以不是可调上限，不做成配置项。
+FAQ_RELATED_QUERY_COUNT = 3
+
 
 def chunk_text(text: str, size: int = TOKEN_CHUNK_SIZE) -> Iterator[str]:
     """把完整答案切块逐段下发。"""
     return (text[index : index + size] for index in range(0, len(text), size))
+
+
+@dataclass(slots=True)
+class FaqProbeResult:
+    """FAQ 探测结果：命中的标准答案 + 库里其他相近问题。
+
+    `hit` 为 None 表示未命中（不直返）。`related_queries` **要么是 3 条、要么是空列表** ——
+    「凑不满三条就不返回」在构造时就已经收敛好，调用方直接 `if probe.related_queries`
+    判断即可，不必再数一遍条数。
+    """
+
+    hit: RetrievalHit | None = None
+    related_queries: list[str] = field(default_factory=list)
 
 
 class RagAgent:
@@ -85,12 +103,12 @@ class RagAgent:
         async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
             kb = KnowledgeBaseClient(self.settings, client)
             # 原问题与关键词替换后的问题各探一次 FAQ，高置信命中直接返回库中标准答案。
-            direct = await self._faq_probe(kb, query, replace_keyword_query, request.ranges)
-            if direct:
-                yield sse("sources", self._sources([direct]))
-                async for event in self._stream_faq_answer(polish_prompt, query, direct):
+            probe = await self._faq_probe(kb, query, replace_keyword_query, request.ranges)
+            if probe.hit:
+                async for event in self._faq_direct(
+                    probe, polish_prompt, query, "faq", replace_keyword_query
+                ):
                     yield event
-                yield sse("done", {"answer_type": "faq", "query": replace_keyword_query})
                 return
 
             yield sse("status", {"stage": "rewrite", "message": "正在进行问题改写"})
@@ -110,12 +128,12 @@ class RagAgent:
             if rewritten:
                 yield sse("status", {"stage": "rewritten", "query": rewritten})
                 # 改写后 FAQ 再探一次：命中即可省掉跨库检索与生成
-                direct = await self._faq_probe(kb, query, rewritten, request.ranges)
-                if direct:
-                    yield sse("sources", self._sources([direct]))
-                    async for event in self._stream_faq_answer(polish_prompt, query, direct):
+                probe = await self._faq_probe(kb, query, rewritten, request.ranges)
+                if probe.hit:
+                    async for event in self._faq_direct(
+                        probe, polish_prompt, query, "faq_rewrite", rewritten
+                    ):
                         yield event
-                    yield sse("done", {"answer_type": "faq_rewrite", "query": rewritten})
                     return
             else:
                 yield sse("status", {"stage": "rewrite_failed", "message": "改写失败，使用原问题检索"})
@@ -156,6 +174,33 @@ class RagAgent:
                 yield sse("token", {"content": "未能生成答案，请稍后重试。"})
             yield sse("done", {"answer_type": "rag", "query": rewritten or replace_keyword_query})
 
+    async def _faq_direct(
+        self,
+        probe: FaqProbeResult,
+        prompt: Prompt | None,
+        query: str,
+        answer_type: str,
+        done_query: str,
+    ) -> AsyncIterator[str]:
+        """FAQ 直返的完整事件序列：sources → 润色流式 → 相近问题 → done。
+
+        相近问题在**探测阶段就已经拿到**（`probe.related_queries`），但要等大模型把答案
+        输出完才能下发 —— 所以它排在 `_stream_faq_answer` 之后，作为**一条** `related_queries`
+        事件把三条一次带走（前端拿到就能整块渲染引导项，不必逐条拼接）。
+        凑不满 3 条时列表为空，一条都不发。
+        两个直返分支（首轮命中 / 改写后命中）只差 `answer_type` 与 `done` 里的 query，
+        共用这里，免得顺序规则在两处各写一遍、日后漏改一处。
+        """
+        hit = probe.hit
+        if hit is None:  # 调用方已判过，这里只是收窄类型
+            return
+        yield sse("sources", self._sources([hit]))
+        async for event in self._stream_faq_answer(prompt, query, hit):
+            yield event
+        if probe.related_queries:
+            yield sse("related_queries", {"queries": probe.related_queries})
+        yield sse("done", {"answer_type": answer_type, "query": done_query})
+
     async def _stream_faq_answer(
         self, prompt: Prompt | None, query: str, hit: RetrievalHit
     ) -> AsyncIterator[str]:
@@ -185,22 +230,50 @@ class RagAgent:
 
     async def _faq_probe(
         self, kb: KnowledgeBaseClient, first: str, second: str, ranges: list[KnowledgeRange]
-    ) -> RetrievalHit | None:
-        """两个 query 变体各召回一次标准问答，返回高置信命中（无命中则为 None）。
+    ) -> FaqProbeResult:
+        """两个 query 变体各召回一次标准问答，返回高置信命中 + 其他相近问题。
 
         **只探门户显式标注的标准问答库（`knowledgeType == 2`）**：FAQ 直返靠的是库里
         人工维护的 QA 对，切片库（1）里没有这种东西，拿它去探只会白跑一次跨库检索。
         未传 `knowledge_type` 的 range **不视为 QA 库**，「没标类型」和「标了 QA」是两回事 ——
         按未知保留会让切片库也被拿去当 FAQ 探，等于凭空多一次跨库检索而永远不可能命中。
         召回本身是跨库检索，由 `KnowledgeBaseClient` 再按 (project_id, tenantId) 分组发请求。
+
+        「其他相近问题」直接复用这一次召回的结果（QA 命中自带 `question`），**不额外发请求**：
+        排除选中作答的那条、按分数序去重取 `FAQ_RELATED_QUERY_COUNT` 条，凑不满就给空列表。
+        未命中（不直返）时不给相近问题 —— 没有可信答案，光推几个问题没有意义。
         """
         candidates = [item for item in ranges if item.knowledge_type == KNOWLEDGE_TYPE_QA]
         if not candidates:
-            return None
+            return FaqProbeResult()
         first_hits, second_hits = await asyncio.gather(
             kb.faq_retrieve(first, candidates), kb.faq_retrieve(second, candidates)
         )
-        return self._faq_match(self._dedupe(first_hits + second_hits))
+        hits = self._dedupe(first_hits + second_hits)
+        matched = self._faq_match(hits)
+        if matched is None:
+            return FaqProbeResult()
+        return FaqProbeResult(hit=matched, related_queries=self._related_queries(hits, matched))
+
+    @staticmethod
+    def _related_queries(hits: list[RetrievalHit], matched: RetrievalHit) -> list[str]:
+        """从召回命中里挑出「其他相近问题」，凑不满 `FAQ_RELATED_QUERY_COUNT` 条则返回空列表。
+
+        命中项已按分数降序（`_dedupe` 排过序），这里顺着取就是「除答案外最相近的几条」。
+        没有 `question` 的命中（切片库、或平台没给 qa_pairs）直接跳过 —— 宁缺毋滥，
+        反正凑不满就不下发。
+        """
+        seen = {matched.question} if matched.question else set()
+        related: list[str] = []
+        for item in hits:
+            question = (item.question or "").strip()
+            if not question or question in seen:
+                continue
+            seen.add(question)
+            related.append(question)
+            if len(related) == FAQ_RELATED_QUERY_COUNT:
+                return related
+        return []
 
     def _faq_match(self, hits: list[RetrievalHit]) -> RetrievalHit | None:
         """取最高分命中；未达阈值时不直返，把最高分打进日志便于回调阈值。

@@ -148,7 +148,7 @@ PYTHONPATH=. .venv/bin/python scripts/verify_message_assembly.py
 
 ## 检索链路
 
-1. **FAQ 直返探测**：先按 `knowledgeType=2` 把 `ranges` 收窄到**标准问答库**（切片库里没有可直接回答的 QA 对，探它只会白跑），再按 `(project_id, tenantId)` 分组，每轮对两个 query 变体（原问题、术语映射后的问题）各发一次**跨库检索** `kbs:mix-retrieve`。最高分 ≥ `FAQ_SIMILARITY_THRESHOLD` 时直接返回库中标准答案（`chunk.qa_pairs[].answer` 优先于 `chunk.content`，经 `answer_polish` 润色后流式下发，`answer_type` 为 `faq`）；改写成功后再探一轮，命中则 `answer_type` 为 `faq_rewrite`。
+1. **FAQ 直返探测**：先按 `knowledgeType=2` 把 `ranges` 收窄到**标准问答库**（切片库里没有可直接回答的 QA 对，探它只会白跑），再按 `(project_id, tenantId)` 分组，每轮对两个 query 变体（原问题、术语映射后的问题）各发一次**跨库检索** `kbs:mix-retrieve`。最高分 ≥ `FAQ_SIMILARITY_THRESHOLD` 时直接返回库中标准答案（`chunk.qa_pairs[].answer` 优先于 `chunk.content`，经 `answer_polish` 润色后流式下发，`answer_type` 为 `faq`）；改写成功后再探一轮，命中则 `answer_type` 为 `faq_rewrite`。命中时还会把库里**其他相近问题**（同一次召回的 `chunk.qa_pairs[].question`，排除作答那条）凑满 3 条、在 token 流结束后作为一条 `related_queries` 事件下发。
 2. **跨库混合检索**：未命中 FAQ 时先改写 query，随后调用**跨库召回接口** `kbs:mix-retrieve`——一次请求覆盖 `ranges` 内全部知识库，结果由平台统一重排：
 
 ```json
@@ -199,4 +199,13 @@ PYTHONPATH=. .venv/bin/python scripts/verify_mix_retrieve.py
 用于定位空间与判断是否标准问答库。都不传时回落全局 `KB_PROJECT_ID` / `KB_TENANT_ID`；
 `knowledgeType` 必须是 `2` 才会走 FAQ 直返，不传或传 `1` 一律跳过 FAQ 探测。
 
-响应为 SSE：`status` 表示处理阶段、`token` 为最终答案增量、`sources` 为检索来源、`done` 表示结束。FAQ 高置信命中的 `done` 事件 `answer_type` 为 `faq`（首轮命中）或 `faq_rewrite`（改写后命中），其答案经润色后流式下发；润色调用失败时回落库中原文。
+响应为 SSE：`status` 表示处理阶段、`token` 为最终答案增量、`sources` 为检索来源、`related_queries` 为其他相近问题、`done` 表示结束。FAQ 高置信命中的 `done` 事件 `answer_type` 为 `faq`（首轮命中）或 `faq_rewrite`（改写后命中），其答案经润色后流式下发；润色调用失败时回落库中原文。
+
+FAQ 直返时，**等 token 流全部下发完**（`done` 之前）会补发**一条** `related_queries` 事件，三条一次带走：
+
+```
+event: related_queries
+data: {"queries":["提前还款需要预约吗","提前还款收违约金吗","线上能办提前还款吗"]}
+```
+
+内容是本次召回里**除选中作答那条以外**的其他 QA 问题原文，按相似度排序取 3 条 —— 数组顺序即相似度序。**凑不满 3 条就整段不发**（不会出现 1~2 条的情况），未命中 FAQ 的普通检索回答也不发该事件。
