@@ -165,7 +165,7 @@ class RagAgent:
         normalized = normalize_query(query)
         # 库中关键词（术语）替换；库不可用时映射表为空，替换结果与原问题相同
         replace_keyword_query = (await self._terms.mapper()).apply(normalized)
-        yield sse("status", {"stage": "normalized", "query": replace_keyword_query})
+        yield sse("status", {"stage": "normalized", "message": "正在进行关键词替换"})
 
         # 三条提示词各自在**用到的那条分支**里现取，不提前一次性取好：
         # FAQ 首轮直返走不到改写提示词，生成失败的请求也没用到润色提示词。
@@ -173,6 +173,7 @@ class RagAgent:
         polish_prompt = await self._prompts.get(self.settings.prompt_key_answer_polish)
         async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
             kb = KnowledgeBaseClient(self.settings, client)
+            yield sse("status", {"stage": "faq", "message": "正在进行FAQ检索"})
             # 原问题与关键词替换后的问题各探一次 FAQ，高置信命中直接返回库中标准答案。
             probe = await self._faq_probe(kb, query, replace_keyword_query, request.ranges)
             if probe.hit:
@@ -194,12 +195,10 @@ class RagAgent:
                     previous_turns,
                 )
             )
-            if result.keywords:
-                yield sse("status", {"stage": "tags_extracted", "tags": result.keywords})
             rewritten = result.rewritten_query
 
             if rewritten:
-                yield sse("status", {"stage": "rewritten", "query": rewritten})
+                yield sse("status", {"stage": "faq_second", "query": "二次FAQ检索"})
                 # 改写后 FAQ 再探一次：命中即可省掉跨库检索与生成
                 probe = await self._faq_probe(kb, query, rewritten, request.ranges)
                 if probe.hit:
@@ -219,8 +218,8 @@ class RagAgent:
             )
             sources = hits[: self.settings.final_context_top_k]
             if not sources:
-                yield sse("token", {"content": "未在已授权知识库中检索到可用于回答的内容。"})
-                yield sse("done", {"answer_type": "no_context"})
+                yield sse("token", {"content": "未在知识库中检索到可用于回答的内容。"})
+                yield sse("done", {})
                 return
             yield sse("sources", self._sources(sources))
             context = "\n\n".join(
@@ -270,7 +269,6 @@ class RagAgent:
         hit = probe.hit
         if hit is None:  # 调用方已判过，这里只是收窄类型
             return
-        yield sse("sources", self._sources([hit]))
         yield sse("status", {"stage": "answer_polish", "message": "正在润色答案"})
         messages = build_polish_messages(prompt or DEFAULT_POLISH_PROMPT, query, hit.content)
         streamed = False
@@ -281,9 +279,10 @@ class RagAgent:
         if not streamed:
             for piece in chunk_text(hit.content):
                 yield sse("token", {"content": piece})
+        yield sse("end", {})
         if probe.related_queries:
             yield sse("related_queries", {"queries": probe.related_queries})
-        yield sse("done", {"answer_type": answer_type, "query": done_query})
+        yield sse("done", {})
 
     async def _faq_probe(
         self, kb: KnowledgeBaseClient, first: str, second: str, ranges: list[KnowledgeRange]

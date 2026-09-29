@@ -50,7 +50,7 @@ def parse_rewrite_json(text: str) -> RewriteResult:
             rewritten = normalize_query(candidate)
             break
 
-    raw_keywords = value.get("keywords") or value.get("tags") or []
+    raw_keywords = value.get("keywords") or []
     keywords = (
         [str(item).strip() for item in raw_keywords if str(item).strip()][:KEYWORD_LIMIT]
         if isinstance(raw_keywords, list)
