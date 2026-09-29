@@ -32,7 +32,7 @@ python3.12 -m venv .venv
 .venv/bin/uvicorn app.main:app --reload
 ```
 
-必须配置 `KB_PLATFORM_BASE_URL`、`KB_PROJECT_ID` 和银行环境需要的鉴权信息。模型密钥请放入 `MODEL_ACCESS_KEY`，不要提交 `.env`。
+必须配置 `KB_PLATFORM_BASE_URL`、`KB_PROJECT_ID` 和银行环境需要的鉴权信息。模型密钥请放入 `REWRITE_MODEL_KEY` / `ANSWER_MODEL_KEY`，不要提交 `.env`。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -153,15 +153,14 @@ PYTHONPATH=. .venv/bin/python scripts/verify_message_assembly.py
 
 改写模型**惰性创建**：`RagAgent` 构造时不会初始化 `ChatOpenAI`，FAQ 首轮直返等走不到改写环节的请求也不会触发创建，只有真正进入改写才建（`RagAgent._ensure_rewrite_model`）。调用是非流式的，因此改写阶段不再下发 `rewrite_token` 增量事件。
 
-模型客户端**就地组装，没有公共包装层**：`ChatOpenAI(...)` 只在两个用到它的地方各写一遍 —— 改写在 `RagAgent._ensure_rewrite_model()`，回答在 `RagAgent._ensure_answer_model()`（FAQ 润色与最终答案生成共用同一个实例）。组装时把 `/chat/completions` 后缀去掉（openai 客户端会自己补），鉴权用 `MODEL_ACCESS_KEY`：`api_key` 位置与真实鉴权头 `accessKey` 都用它。模型配置：
+模型客户端**就地组装，没有公共包装层**：`ChatOpenAI(...)` 只在两个用到它的地方各写一遍 —— 改写在 `RagAgent._ensure_rewrite_model()`，回答在 `RagAgent._ensure_answer_model()`（FAQ 润色与最终答案生成共用同一个实例）。组装时把 `/chat/completions` 后缀去掉（openai 客户端会自己补），鉴权用各自的 `*_MODEL_KEY`：`api_key` 位置与真实鉴权头 `accessKey` 都用它。模型配置：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `REWRITE_MODEL_URL` / `REWRITE_MODEL_NAME` | 见 `.env.example` | 改写模型地址与模型名 |
-| `ANSWER_MODEL_URL` / `ANSWER_MODEL_NAME` | 空 / `Qwen3-32B` | 答案模型（流式生成 + FAQ 润色）地址与模型名 |
-| `MODEL_ACCESS_KEY` | 空 | 模型鉴权：Bearer 与 `accessKey` 头都用它；留空时 `api_key` 位置给占位串 |
+| `REWRITE_MODEL_URL` / `REWRITE_MODEL_NAME` / `REWRITE_MODEL_KEY` | 见 `.env.example` | 改写模型地址、模型名与密钥 |
+| `ANSWER_MODEL_URL` / `ANSWER_MODEL_NAME` / `ANSWER_MODEL_KEY` | 空 / `Qwen3-32B` / 空 | 答案模型（流式生成 + FAQ 润色）地址、模型名与密钥 |
 
-**每个模型各配一条完整地址（含 `/chat/completions`），互不覆盖** —— 不做「全局 base + 局部覆盖」那种双层配置：少一层优先级要记，也不会出现全局变量把某个模型的专用路径（如答案模型带模型 uuid 的 `/api/model/{uuid}/chat/completions`）悄悄顶掉、还不报错的情况。两个模型的地址留空时取用都会抛错（否则 `base_url` 为空会静默打到 api.openai.com，而两侧调用失败都只吞成一条 warning，很难发现）。地址与密钥的组装有独立回归：`scripts/verify_model_config.py`。
+**每个模型各配一条完整地址（含 `/chat/completions`）和一个密钥，两组配置完全对称、互不覆盖** —— 不做「全局 base / 全局密钥 + 局部覆盖」那种双层配置：少一层优先级要记，也不会出现全局变量把某个模型的专用路径（如答案模型带模型 uuid 的 `/api/model/{uuid}/chat/completions`）或专用密钥悄悄顶掉、还不报错的情况。两个模型的地址留空时取用都会抛错（否则 `base_url` 为空会静默打到 api.openai.com，而两侧调用失败都只吞成一条 warning，很难发现）；密钥留空时 `api_key` 位置给占位串且不带 `accessKey` 头。地址与密钥的组装有独立回归：`scripts/verify_model_config.py`。
 
 生成与 FAQ 润色都**直接用 `ChatOpenAI` 流式调用**（`astream`，不套 agent）：两者都是「喂 messages、要一段流式文本」，用的是同一个回答模型，差别只在提示词，因此共用 `RagAgent._stream_tokens()`，由调用方决定装配哪条提示词。RAG 链路的生成一步到位（取 `answer_summary`，资料以 `{ragkm}` 注入 user 段），生成即最终答案，不再润色 / 总结；FAQ 高置信命中则用 `answer_polish` 润色后流式下发，只装配 `{query}` 与 `{answer}`。
 

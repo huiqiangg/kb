@@ -197,13 +197,17 @@
   （`ChatStreamAgent`）、`app/services/rewrite_agent.py`（`QueryRewriteAgent` + `build()` +
   `create_agent` + 模块单例）**全部已删，不要再加回来**。`ChatOpenAI(...)` 只在两处各写一遍，
   都在 `RagAgent`：改写在 `_ensure_rewrite_model()`、回答在 `_ensure_answer_model()`。
-  组装规则：base_url 去 `/chat/completions` 后缀；鉴权 `MODEL_ACCESS_KEY` 同时作 `api_key`
-  与 `accessKey` 头，留空时 api_key 给 `"EMPTY"`。
+  组装规则：base_url 去 `/chat/completions` 后缀；鉴权用**各自模型的密钥**
+  `REWRITE_MODEL_KEY` / `ANSWER_MODEL_KEY`（同时作 `api_key` 与 `accessKey` 头），
+  留空时 api_key 给 `"EMPTY"`、不带 `accessKey` 头。
   **两侧地址留空时都要抛 RuntimeError 并点名变量**（`REWRITE_MODEL_URL` / `ANSWER_MODEL_URL`）——
   空 base_url 会静默打到 api.openai.com，而两侧失败都只吞成 warning。
-  **地址只有一个来源：每个模型自己的 `*_MODEL_URL`。** 曾有 `OPENAI_BASE_URL`/`OPENAI_API_KEY`
-  两个「全局网关地址/密钥」变量，**用户要求删掉，不要再加回来**（曾把答案模型带模型 uuid 的
-  路径顶换成改写模型的路径，且不报错）。回归 `scripts/verify_model_config.py`（4 组）。
+  **地址与密钥都只有一个来源：每个模型自己那组 `*_MODEL_URL` / `*_MODEL_KEY`。**
+  曾有 `OPENAI_BASE_URL`/`OPENAI_API_KEY` 两个「全局网关地址/密钥」变量，**用户要求删掉**；
+  后来又收敛出来的全局 `MODEL_ACCESS_KEY` 也按同一条逻辑拆成两个 per-model key 并删除
+  （2026-09-29，用户原话「env 配置中缺少 `REWRITE_MODEL_KEY` 和 `ANSWER_MODEL_KEY`」）——
+  **不要再加回任何一种全局覆盖变量**（曾把答案模型带模型 uuid 的路径顶换成改写模型的路径，且不报错）。
+  回归 `scripts/verify_model_config.py`（4 组，含「两模型地址与密钥互不覆盖」）。
   剥离 `create_agent` 后 `langchain` / `langgraph*` 不再是直接依赖，
   `pyproject.toml` 已去掉 `langchain`，`uv lock` 一并清掉 6 个包（111 行）。
 

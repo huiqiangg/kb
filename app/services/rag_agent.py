@@ -81,18 +81,18 @@ class RagAgent:
         """取改写模型，首次用到才建（构造期建它属于白付初始化代价）。
 
         地址取 `REWRITE_MODEL_URL`（去掉 `/chat/completions`：openai 客户端会自己补），
-        鉴权用 `MODEL_ACCESS_KEY`：`api_key` 位置与真实鉴权头 `accessKey` 都用它。
+        鉴权用 `REWRITE_MODEL_KEY`：`api_key` 位置与真实鉴权头 `accessKey` 都用它。
         **未配地址时抛 RuntimeError**，理由同 `_ensure_answer_model` —— 空 base_url 会静默
         把问题发到 api.openai.com，而改写失败又只吞成一条 warning，很难发现。
         """
         if self._rewrite_model is None:
             if not self.settings.rewrite_model_url:
                 raise RuntimeError("未配置 REWRITE_MODEL_URL")
-            access_key = self.settings.model_access_key
+            access_key = self.settings.rewrite_model_key
             self._rewrite_model = ChatOpenAI(
                 model=self.settings.rewrite_model_name,
                 base_url=self.settings.rewrite_model_url.removesuffix("/chat/completions"),
-                api_key=access_key or "EMPTY",
+                api_key=access_key,
                 timeout=self.settings.request_timeout_seconds,
                 max_retries=1,
                 default_headers={"accessKey": access_key} if access_key else None,
@@ -104,17 +104,18 @@ class RagAgent:
 
         就是 `ChatOpenAI(...)` 本身，不再包一层 agent —— 无工具的 agent 除了多一层
         graph 之外什么都没做，直接用模型的 `astream` 下发增量更直白。
-        地址取 `ANSWER_MODEL_URL`（同样去掉 `/chat/completions`），鉴权同上。
-        **未配地址时抛 RuntimeError** —— 否则 base_url 为空会静默打到 api.openai.com。
+        地址取 `ANSWER_MODEL_URL`（同样去掉 `/chat/completions`），鉴权用 `ANSWER_MODEL_KEY`
+        （与改写模型各配各的，互不覆盖）。**未配地址时抛 RuntimeError** —— 否则 base_url
+        为空会静默打到 api.openai.com。
         """
         if self._answer_model is None:
             if not self.settings.answer_model_url:
                 raise RuntimeError("未配置 ANSWER_MODEL_URL")
-            access_key = self.settings.model_access_key
+            access_key = self.settings.answer_model_key
             self._answer_model = ChatOpenAI(
                 model=self.settings.answer_model_name,
                 base_url=self.settings.answer_model_url.removesuffix("/chat/completions"),
-                api_key=access_key or "EMPTY",
+                api_key=access_key,
                 timeout=self.settings.request_timeout_seconds,
                 max_retries=1,
                 default_headers={"accessKey": access_key} if access_key else None,

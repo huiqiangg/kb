@@ -20,13 +20,15 @@ class Settings(BaseSettings):
     # 留空则复用 kb_mix_retrieve_url（即两通道同地址）
     kb_faq_retrieve_url: str = ""
     # ---- 模型服务：改写（非流式 JSON）与最终答案（流式文本） ----
-    # 每个模型各一条完整地址（含 /chat/completions），各自独立、互不覆盖。
+    # 每个模型各一条完整地址（含 /chat/completions）、各一个密钥，两组配置完全对称、
+    # 各自独立、互不覆盖 —— 不做「全局地址/全局密钥 + 局部覆盖」那种双层配置，
+    # 少一层优先级要记，也不会出现全局值把某个模型的专用路径/密钥悄悄顶掉还不报错的情况。
     rewrite_model_url: str = "http://77.6.65.47:8099/api/model/chat/completions"
     rewrite_model_name: str = "Qwen2.5-coder-7B-Instruct"
+    rewrite_model_key: str = ""
     answer_model_url: str = ""
     answer_model_name: str = "Qwen3-32B"
-    # 鉴权：Bearer 与 accessKey 两种头都带这个值
-    model_access_key: str = ""
+    answer_model_key: str = ""
     faq_similarity_threshold: float = 0.98
     retrieval_top_k: int = 12
     final_context_top_k: int = 6

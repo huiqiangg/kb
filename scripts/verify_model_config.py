@@ -8,9 +8,10 @@
 两处规则相同，因此都用「探针 + 真类」的方式验证：把模块里的 `ChatOpenAI` 换成
 记录 kwargs 再交回真类的函数，断言**真实调用点传了哪些参数**，同时真类照常实例化
 （参数名写错会立刻暴露）。规则：
-- 每个模型各配一条完整地址（`REWRITE_MODEL_URL` / `ANSWER_MODEL_URL`），组装时只去掉
-  `/chat/completions` 后缀，两条地址互不覆盖；
-- 鉴权用 `MODEL_ACCESS_KEY`（Bearer 与 `accessKey` 头都用它），留空时 `api_key`
+- 每个模型各配一条完整地址（`REWRITE_MODEL_URL` / `ANSWER_MODEL_URL`）与一个密钥
+  （`REWRITE_MODEL_KEY` / `ANSWER_MODEL_KEY`），组装时只去掉 `/chat/completions` 后缀，
+  两条地址、两个密钥都互不覆盖；
+- 鉴权用各自的 `*_MODEL_KEY`（Bearer 与 `accessKey` 头都用它），留空时 `api_key`
   位置给占位串；
 - 两个模型**都**在地址留空时抛 RuntimeError（否则 base_url 为空会静默打到 api.openai.com），
   且必须是**懒建**——构造 `RagAgent` 本身不该抛。
@@ -79,8 +80,13 @@ def case_answer_model() -> None:
 
 
 def case_two_models_independent() -> None:
-    """改写与回答模型各用各的地址，互不影响（含带模型 uuid 的路径）。"""
-    settings = Settings(rewrite_model_url=REWRITE_URL, answer_model_url=ANSWER_URL)
+    """改写与回答模型各用各的地址与密钥，互不影响（含带模型 uuid 的路径）。"""
+    settings = Settings(
+        rewrite_model_url=REWRITE_URL,
+        rewrite_model_key="rw-key",
+        answer_model_url=ANSWER_URL,
+        answer_model_key="ans-key",
+    )
 
     with spy_chat_openai(rag_module) as rewrite_kwargs:
         RagAgent(settings)._ensure_rewrite_model()
@@ -103,6 +109,13 @@ def case_two_models_independent() -> None:
         False,
     )
     check("改写模型名", rewrite_kwargs.get("model"), settings.rewrite_model_name)
+    check("改写模型 api_key", rewrite_kwargs.get("api_key"), "rw-key")
+    check("回答模型 api_key", answer_kwargs.get("api_key"), "ans-key")
+    check(
+        "两者密钥不同",
+        rewrite_kwargs.get("api_key") == answer_kwargs.get("api_key"),
+        False,
+    )
 
 
 def case_missing_model_url() -> None:
@@ -128,28 +141,28 @@ def case_missing_model_url() -> None:
 
 
 def case_keys() -> None:
-    """密钥与鉴权头：MODEL_ACCESS_KEY 有值则两处都用它，留空则占位串且不带 accessKey。"""
-    settings = Settings(model_access_key="ak-key", answer_model_url=ANSWER_URL)
+    """密钥与鉴权头：各自的 `*_MODEL_KEY` 有值则两处都用它，留空则占位串且不带 accessKey。"""
+    settings = Settings(answer_model_key="ans-key", answer_model_url=ANSWER_URL)
     with spy_chat_openai(rag_module) as kwargs:
         RagAgent(settings)._ensure_answer_model()
-    check("api_key 用 MODEL_ACCESS_KEY", kwargs.get("api_key"), "ak-key")
-    check("accessKey 头带上", kwargs.get("default_headers"), {"accessKey": "ak-key"})
+    check("回答模型 api_key 用 ANSWER_MODEL_KEY", kwargs.get("api_key"), "ans-key")
+    check("accessKey 头带上", kwargs.get("default_headers"), {"accessKey": "ans-key"})
 
     with spy_chat_openai(rag_module) as empty:
-        RagAgent(Settings(model_access_key="", answer_model_url=ANSWER_URL))._ensure_answer_model()
+        RagAgent(Settings(answer_model_key="", answer_model_url=ANSWER_URL))._ensure_answer_model()
     check("留空时 api_key 给占位串", empty.get("api_key"), "EMPTY")
     check("留空时不带 accessKey 头", empty.get("default_headers"), None)
 
     with spy_chat_openai(rag_module) as rewrite_kwargs:
-        settings = Settings(model_access_key="ak-key", rewrite_model_url=REWRITE_URL)
+        settings = Settings(rewrite_model_key="rw-key", rewrite_model_url=REWRITE_URL)
         RagAgent(settings)._ensure_rewrite_model()
-    check("改写模型同样用 MODEL_ACCESS_KEY", rewrite_kwargs.get("api_key"), "ak-key")
+    check("改写模型 api_key 用 REWRITE_MODEL_KEY", rewrite_kwargs.get("api_key"), "rw-key")
 
 
 def main() -> int:
     for name, case in (
         ("回答模型组装", case_answer_model),
-        ("两个模型地址互不影响", case_two_models_independent),
+        ("两个模型地址与密钥互不覆盖", case_two_models_independent),
         ("模型未配地址", case_missing_model_url),
         ("密钥与鉴权头", case_keys),
     ):
