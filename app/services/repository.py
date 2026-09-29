@@ -164,7 +164,6 @@ class PromptRepository:
             prompts[name] = Prompt(
                 system=_text_column(row, "system_content"), user=user_content
             )
-        logger.info("提示词配置表已加载：%s", ", ".join(sorted(prompts)) or "无")
         return prompts
 
     def invalidate(self) -> None:
