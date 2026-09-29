@@ -131,12 +131,17 @@ PYTHONPATH=. .venv/bin/python scripts/verify_message_assembly.py
 
 `keywords` 替代了原来单独的「标签提取」模型调用，SSE 的 `tags_extracted` 事件数据来自这里。解析做容错（兼容旧字段 `query`/`tags`），调用失败或输出不可解析时回落原始 query 继续检索，不中断问答。
 
-改写 agent **惰性创建**：`RagAgent` 构造时不会初始化 `ChatOpenAI`，FAQ 首轮直返等走不到改写环节的请求也不会触发创建，只有真正进入改写才建（进程内单例复用）。调用是非流式的，因此改写阶段不再下发 `rewrite_token` 增量事件。相关配置：
+改写 agent **惰性创建**：`RagAgent` 构造时不会初始化 `ChatOpenAI`，FAQ 首轮直返等走不到改写环节的请求也不会触发创建，只有真正进入改写才建（进程内单例复用）。调用是非流式的，因此改写阶段不再下发 `rewrite_token` 增量事件。
+
+两个 agent 的模型都经 `app/services/chat_model.py` 组装（`ChatOpenAI`，base_url 去掉 `/chat/completions` 后缀，鉴权走 `accessKey` 头 + Bearer）。模型配置：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `OPENAI_BASE_URL` | 空 | 改写模型的 OpenAI 兼容地址；留空按 `REWRITE_MODEL_URL` 去掉 `/chat/completions` 推导 |
-| `OPENAI_API_KEY` | 空 | 改写模型密钥；留空复用 `MODEL_ACCESS_KEY`（Bearer 与 `accessKey` 头都会带上） |
+| `REWRITE_MODEL_URL` / `REWRITE_MODEL_NAME` | 见 `.env.example` | 改写模型地址与模型名 |
+| `ANSWER_MODEL_URL` / `ANSWER_MODEL_NAME` | 空 / `Qwen3-32B` | 答案模型（流式生成 + FAQ 润色）地址与模型名 |
+| `MODEL_ACCESS_KEY` | 空 | 模型鉴权：Bearer 与 `accessKey` 头都用它；留空时 `api_key` 位置给占位串 |
+
+**每个模型各配一条完整地址（含 `/chat/completions`），互不覆盖** —— 不做「全局 base + 局部覆盖」那种双层配置：少一层优先级要记，也不会出现全局变量把某个模型的专用路径（如答案模型带模型 uuid 的 `/api/model/{uuid}/chat/completions`）悄悄顶掉、还不报错的情况。地址与密钥的解析有独立回归：`scripts/verify_model_config.py`。
 
 生成与 FAQ 润色都走 **langchain `create_agent` + OpenAI 兼容协议**的流式 agent（`app/services/stream_agent.py`，`ChatStreamAgent`）：两者都是「喂 messages、要一段流式文本」，用的是同一个回答模型，差别只在提示词，因此只保留一个实现，由调用方决定装配哪条提示词。RAG 链路的生成一步到位（取 `answer_summary`，资料以 `{ragkm}` 注入 user 段），生成即最终答案，不再润色 / 总结；FAQ 高置信命中则用 `answer_polish` 润色后流式下发，只装配 `{query}` 与 `{answer}`。
 

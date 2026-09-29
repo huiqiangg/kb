@@ -19,10 +19,13 @@ class Settings(BaseSettings):
     kb_mix_retrieve_url: str = ""
     # 留空则复用 kb_mix_retrieve_url（即两通道同地址）
     kb_faq_retrieve_url: str = ""
+    # ---- 模型服务：改写（非流式 JSON）与最终答案（流式文本） ----
+    # 每个模型各一条完整地址（含 /chat/completions），各自独立、互不覆盖。
     rewrite_model_url: str = "http://77.6.65.47:8099/api/model/chat/completions"
     rewrite_model_name: str = "Qwen2.5-coder-7B-Instruct"
     answer_model_url: str = ""
     answer_model_name: str = "Qwen3-32B"
+    # 鉴权：Bearer 与 accessKey 两种头都带这个值
     model_access_key: str = ""
     faq_similarity_threshold: float = 0.98
     retrieval_top_k: int = 12
@@ -44,12 +47,6 @@ class Settings(BaseSettings):
     db_connect_timeout: float = 5.0
     # 术语映射与提示词的进程内缓存时长，过期后下次请求重新加载。
     db_cache_ttl_seconds: int = 60
-
-    # ---- OpenAI 兼容格式：query 改写（langchain create_agent） ----
-    # 留空则从 rewrite_model_url 去掉 /chat/completions 推导
-    openai_base_url: str = ""
-    # 留空则复用 model_access_key；网关同时收到 Bearer 与 accessKey 两种头
-    openai_api_key: str = ""
 
     # ---- prompt key 映射：与 db.sql 中 rag_prompt 的记录一一对应 ----
     # Query 改写 + 关键词提取（只用于改写环节）
